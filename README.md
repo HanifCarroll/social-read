@@ -134,6 +134,35 @@ social-read URL --out ./captures/post --comments --max-expansion-rounds 50
 social-read URL --out ./captures/post --comments --max-comments 200
 ```
 
+Follow platform redirects during comment expansion:
+
+```sh
+social-read URL \
+  --out ./captures/post \
+  --comments \
+  --follow-comment-redirects
+```
+
+Capture a recursive comment tree by visiting captured comment URLs and attaching
+their replies under the parent comment:
+
+```sh
+social-read URL \
+  --out ./captures/post \
+  --comment-tree
+```
+
+Bound the recursive traversal when needed:
+
+```sh
+social-read URL \
+  --out ./captures/post \
+  --comment-tree \
+  --max-comment-depth 2 \
+  --max-comment-visits 25 \
+  --max-comments 200
+```
+
 The expansion loop is intentionally UI-driven because LinkedIn and X do not
 expose the full rendered discussion as static HTML. If the platform withholds
 some replies behind permissions, login walls, deleted content, or collapsed
@@ -160,6 +189,10 @@ Important options:
 | Option | Purpose |
 | --- | --- |
 | `--comments` | Expand and capture comments/replies |
+| `--follow-comment-redirects` | Continue from platform redirects during comment expansion |
+| `--comment-tree` | Recursively visit captured comment URLs for nested replies |
+| `--max-comment-depth N` | Cap recursive reply traversal depth |
+| `--max-comment-visits N` | Cap comment pages visited during recursive traversal |
 | `--max-comments N` | Cap extracted comments after expansion |
 | `--max-expansion-rounds N` | Cap comment expansion loop |
 | `--session ID` | Reuse an existing Playwriter session |

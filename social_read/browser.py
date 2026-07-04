@@ -55,6 +55,7 @@ def capture(config: CaptureConfig) -> dict[str, Any]:
             "Comments were requested, but no comments were captured. "
             "The page may require login, or no replies were loaded."
         )
+        _mark_comment_capture_incomplete(raw_result, "no_comments_captured")
 
     _write_post_files(post, paths)
     manifest = _build_manifest(config, post, paths, started_at, raw_result, driver.session)
@@ -225,6 +226,10 @@ def _build_job(config: CaptureConfig, *, platform: str, post_id: str | None) -> 
         "includeComments": config.include_comments,
         "maxComments": config.max_comments,
         "maxExpansionRounds": config.max_expansion_rounds,
+        "followCommentRedirects": config.follow_comment_redirects,
+        "commentTree": config.comment_tree,
+        "maxCommentDepth": config.max_comment_depth,
+        "maxCommentVisits": config.max_comment_visits,
         "timeoutMs": config.timeout_ms,
         "waitMs": config.wait_ms,
         "viewport": {"width": config.viewport_width, "height": config.viewport_height},
@@ -252,6 +257,13 @@ def _new_session_args(config: CaptureConfig) -> list[str]:
 def _write_post_files(post: SocialPost, paths: CapturePaths) -> None:
     paths.post_json.write_text(json.dumps(to_plain(post), indent=2) + "\n", encoding="utf-8")
     paths.post_md.write_text(render_markdown(post), encoding="utf-8")
+
+
+def _mark_comment_capture_incomplete(raw_result: dict[str, Any], reason: str) -> None:
+    capture = raw_result.setdefault("comment_capture", {})
+    if isinstance(capture, dict):
+        capture["complete"] = False
+        capture.setdefault("stopped_reason", reason)
 
 
 def _add_redirect_warning(
@@ -289,6 +301,13 @@ def _build_manifest(
     session: str,
 ) -> dict[str, Any]:
     completed_at = datetime.now(UTC).isoformat()
+    comment_capture = raw_result.get("comment_capture")
+    if not isinstance(comment_capture, dict):
+        comment_capture = {
+            "requested": config.include_comments,
+            "mode": "tree" if config.comment_tree else "flat",
+            "complete": not config.include_comments,
+        }
     return {
         "ok": bool(raw_result.get("ok", True)),
         "tool": "social-read",
@@ -301,6 +320,8 @@ def _build_manifest(
         "url": config.url,
         "final_url": post.final_url,
         "comments_requested": config.include_comments,
+        "comments_complete": bool(comment_capture.get("complete")),
+        "comment_capture": comment_capture,
         "comment_count": _count_comments(post),
         "output_dir": str(paths.output_dir),
         "files": {

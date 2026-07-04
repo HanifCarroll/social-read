@@ -73,3 +73,24 @@ This file records CLI dogfooding rounds and UX changes made after each run.
 - Result: no new `social-read` sessions remained after dogfooding.
 - UX note: default cleanup works; `--keep-session` remains available for debugging.
 - Change made: none.
+
+### Round 11: X Comments With Redirect Following
+
+- Command: `uv run social-read "https://x.com/OpenAI/status/2062927046448431587" --out /tmp/social-read-dogfood-playwriter/x-follow-redirects --comments --follow-comment-redirects --max-expansion-rounds 8 --json`
+- Result: followed X's redirected route during comment expansion and recorded it in `comment_capture.redirects_followed`.
+- UX note: redirect following needs explicit metadata so downstream agents can see that the capture left the requested post URL.
+- Change made: manifest now includes `comments_complete` and a `comment_capture` object with mode, redirect policy, redirects followed, visited comment URLs, and stop reason.
+
+### Round 12: X Comment Tree, First Pass
+
+- Command: `uv run social-read "https://x.com/OpenAI/status/2062927046448431587" --out /tmp/social-read-dogfood-playwriter/x-comment-tree-depth1-2 --comment-tree --max-comment-depth 1 --max-comments 15 --max-expansion-rounds 8 --json`
+- Result: traversal ran too long for practical dogfooding and was interrupted.
+- UX note: `--max-comments` does not bound page visits early enough during recursive traversal.
+- Change made: added `--max-comment-visits` to cap the number of comment URLs visited by `--comment-tree`.
+
+### Round 13: X Comment Tree With Visit Cap
+
+- Command: `uv run social-read "https://x.com/OpenAI/status/2062927046448431587" --out /tmp/social-read-dogfood-playwriter/x-comment-tree-visit1 --comment-tree --max-comment-depth 1 --max-comment-visits 1 --max-comments 25 --max-expansion-rounds 2 --playwriter-timeout-ms 180000 --json`
+- Result: visited one comment URL, kept the base post, wrote full-page and post screenshots, and recorded `visited_comment_urls`.
+- UX note: the sampled visited comment had no nested replies, but the traversal path and metadata are working.
+- Change made: added an X screenshot fallback that uses the first tweet article when the exact post selector is unavailable after traversal.

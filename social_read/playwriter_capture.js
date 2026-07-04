@@ -50,6 +50,7 @@ async function main() {
   let fullPageScreenshotFile = null
   let postScreenshotFile = null
   let htmlFile = null
+  const commentCapture = createCommentCapture(job)
 
   if (!job.url) throw new Error('SOCIAL_READ_JOB.url is required')
 
@@ -81,15 +82,18 @@ async function main() {
     await detectSignInBlockers(capturePage, job.platform, warn)
 
     try {
-      rawPost = await extractPost(capturePage, job)
+      rawPost = await extractBasePost(capturePage, job, warn)
     } catch (err) {
       error = errorMessage(err)
       warn(`Extraction issue: ${error}`)
     }
 
     if (job.includeComments) {
-      await expandComments(capturePage, job, warn)
-      await detectSignInBlockers(capturePage, job.platform, warn)
+      const expansion = await expandComments(capturePage, job, warn)
+      applyExpansionResult(commentCapture, expansion)
+      if (await detectSignInBlockers(capturePage, job.platform, warn)) {
+        markCommentCaptureIncomplete(commentCapture, 'sign_in_blocker')
+      }
       if (pageMatchesRequestedPost(capturePage.url(), job.platform, job.postId)) {
         try {
           rawPost = await extractPost(capturePage, job)
@@ -97,13 +101,36 @@ async function main() {
           error = errorMessage(err)
           warn(`Extraction issue after comment expansion: ${error}`)
         }
+      } else if (job.followCommentRedirects) {
+        const redirectedUrl = capturePage.url()
+        commentCapture.redirects_followed.push(redirectedUrl)
+        warn(
+          `${platformName(job.platform)} redirected away while expanding comments; ` +
+            'followed the redirect and merged captured comments.'
+        )
+        try {
+          const redirectedPost = await extractPost(capturePage, {
+            ...job,
+            postId: statusIdFromUrl(redirectedUrl) || job.postId,
+          })
+          mergePostComments(rawPost, redirectedPost)
+        } catch (err) {
+          markCommentCaptureIncomplete(commentCapture, 'redirect_extraction_failed')
+          warn(`Extraction issue after following comment redirect: ${errorMessage(err)}`)
+        }
       } else {
+        markCommentCaptureIncomplete(commentCapture, 'redirect_not_followed')
         warn(
           `${platformName(job.platform)} redirected away while expanding comments; ` +
             'kept the post extraction from before comment expansion.'
         )
-        await restoreRequestedPost(capturePage, job, warn)
       }
+
+      if (job.commentTree) {
+        await expandCommentTree(capturePage, rawPost, job, warn, commentCapture)
+      }
+
+      await restoreRequestedPost(capturePage, job, warn)
     }
 
     try {
@@ -118,14 +145,25 @@ async function main() {
     }
 
     try {
-      const locator = primaryPostLocator(capturePage, job.platform, job.postId)
+      let locator = primaryPostLocator(capturePage, job.platform, job.postId)
       if (!locator) {
         warn('Primary post screenshot locator was not available.')
-      } else if ((await locator.count()) === 0) {
-        warn('Primary post screenshot target was not found.')
       } else {
-        await locator.first().screenshot({ path: job.postScreenshotPath, scale: 'css' })
-        postScreenshotFile = 'screenshots/post.png'
+        if ((await locator.count()) === 0 && job.platform === 'x') {
+          const secondaryLocator = capturePage.locator(
+            'article[data-tweet-id], article[data-testid="tweet"], article'
+          )
+          if ((await secondaryLocator.count()) > 0) {
+            warn('Exact X post screenshot target was not found; used the first tweet article.')
+            locator = secondaryLocator
+          }
+        }
+        if ((await locator.count()) === 0) {
+          warn('Primary post screenshot target was not found.')
+        } else {
+          await locator.first().screenshot({ path: job.postScreenshotPath, scale: 'css' })
+          postScreenshotFile = 'screenshots/post.png'
+        }
       }
     } catch (err) {
       warn(`Primary post screenshot failed: ${errorMessage(err)}`)
@@ -156,6 +194,7 @@ async function main() {
     htmlFile,
     warnings,
     error,
+    comment_capture: commentCapture,
   }
 }
 
@@ -189,6 +228,21 @@ async function extractPost(page, job) {
   })
 }
 
+async function extractBasePost(page, job, warn) {
+  let post = await extractPost(page, job)
+  if (pageMatchesRequestedPost(post.final_url || page.url(), job.platform, job.postId)) {
+    return post
+  }
+
+  warn(
+    `${platformName(job.platform)} redirected away before base post extraction; ` +
+      'retried the requested post URL.'
+  )
+  await restoreRequestedPost(page, job, warn)
+  post = await extractPost(page, job)
+  return post
+}
+
 async function expandPostText(page, platform, waitMs) {
   const patterns = platform === 'x' ? X_TEXT_EXPAND_BUTTONS : LINKEDIN_TEXT_EXPAND_BUTTONS
   for (let round = 0; round < 3; round += 1) {
@@ -203,8 +257,10 @@ async function expandComments(page, job, warn) {
   let previousSignature = null
   let stableRounds = 0
   const maxRounds = Number(job.maxExpansionRounds || 200)
+  const result = { completed: true, rounds: 0, stopped_reason: null }
 
   for (let round = 0; round < maxRounds; round += 1) {
+    result.rounds = round + 1
     const clicked = await clickMatchingButtons(page, patterns, 20)
     await page.mouse.wheel(0, 3000)
     await page.waitForTimeout(Number(job.waitMs || 1500))
@@ -219,6 +275,8 @@ async function expandComments(page, job, warn) {
     previousSignature = signature
     if (stableRounds >= 3) break
     if (round === maxRounds - 1) {
+      result.completed = false
+      result.stopped_reason = 'max_expansion_rounds'
       warn(`Stopped comment expansion after ${maxRounds} rounds.`)
     }
   }
@@ -227,6 +285,7 @@ async function expandComments(page, job, warn) {
     await page.evaluate(() => window.scrollTo(0, 0))
     await page.waitForTimeout(Math.min(Number(job.waitMs || 1500), 1000))
   } catch {}
+  return result
 }
 
 async function detectSignInBlockers(page, platform, warn) {
@@ -239,11 +298,11 @@ async function detectSignInBlockers(page, platform, warn) {
 
   try {
     const blocker = page.getByText(text)
-    if ((await blocker.count()) === 0) return
-    if (!(await blocker.first().isVisible({ timeout: 500 }))) return
+    if ((await blocker.count()) === 0) return false
+    if (!(await blocker.first().isVisible({ timeout: 500 }))) return false
     warn(warning)
   } catch {
-    return
+    return false
   }
 
   try {
@@ -257,6 +316,7 @@ async function detectSignInBlockers(page, platform, warn) {
   } catch {
     warn(`Could not close the ${platform} sign-in modal before screenshots.`)
   }
+  return true
 }
 
 async function clickMatchingButtons(page, patterns, maxClicks) {
@@ -352,6 +412,254 @@ async function restoreRequestedPost(page, job, warn) {
   } catch (err) {
     warn(`Could not restore requested post for screenshots: ${errorMessage(err)}`)
   }
+}
+
+function createCommentCapture(job) {
+  return {
+    requested: Boolean(job.includeComments),
+    mode: job.commentTree ? 'tree' : 'flat',
+    redirect_policy: job.followCommentRedirects ? 'follow' : 'preserve_post',
+    max_comment_depth: job.maxCommentDepth ?? null,
+    max_comment_visits: job.maxCommentVisits ?? null,
+    complete: true,
+    stopped_reason: null,
+    redirects_followed: [],
+    visited_comment_urls: [],
+    visited_comment_count: 0,
+  }
+}
+
+function applyExpansionResult(commentCapture, result) {
+  if (!result || result.completed !== false) return
+  markCommentCaptureIncomplete(commentCapture, result.stopped_reason || 'expansion_incomplete')
+}
+
+function markCommentCaptureIncomplete(commentCapture, reason) {
+  commentCapture.complete = false
+  if (!commentCapture.stopped_reason) {
+    commentCapture.stopped_reason = reason
+  }
+}
+
+async function expandCommentTree(page, rootPost, job, warn, commentCapture) {
+  if (!rootPost || !Array.isArray(rootPost.comments) || !rootPost.comments.length) {
+    return
+  }
+
+  const visited = new Set([canonicalUrl(job.url)])
+  const queue = []
+  enqueueComments(queue, rootPost.comments, 0)
+
+  while (queue.length) {
+    if (hasReachedCommentBudget(rootPost, job.maxComments)) {
+      markCommentCaptureIncomplete(commentCapture, 'max_comments')
+      break
+    }
+    if (hasReachedVisitBudget(commentCapture, job.maxCommentVisits)) {
+      markCommentCaptureIncomplete(commentCapture, 'max_comment_visits')
+      break
+    }
+
+    const item = queue.shift()
+    if (!item || !item.comment || !item.comment.url) continue
+    if (isPastMaxDepth(item.depth, job.maxCommentDepth)) continue
+
+    const commentUrl = canonicalUrl(item.comment.url)
+    if (!commentUrl || visited.has(commentUrl)) continue
+    visited.add(commentUrl)
+    commentCapture.visited_comment_urls.push(commentUrl)
+    commentCapture.visited_comment_count = commentCapture.visited_comment_urls.length
+
+    const remaining = remainingCommentBudget(rootPost, job.maxComments)
+    if (remaining !== null && remaining <= 0) {
+      markCommentCaptureIncomplete(commentCapture, 'max_comments')
+      break
+    }
+
+    const threadPost = await captureThreadReplies(
+      page,
+      item.comment,
+      item.depth,
+      job,
+      warn,
+      commentCapture,
+      remaining
+    )
+    if (!threadPost || !Array.isArray(threadPost.comments)) continue
+
+    const replies = limitComments(threadPost.comments, remaining)
+    setCommentDepths(replies, item.depth + 1)
+    item.comment.replies = mergeCommentLists(item.comment.replies || [], replies)
+    enqueueComments(queue, item.comment.replies, item.depth + 1)
+  }
+}
+
+async function captureThreadReplies(
+  page,
+  comment,
+  depth,
+  job,
+  warn,
+  commentCapture,
+  remainingBudget
+) {
+  const commentUrl = comment.url
+  const threadJob = {
+    ...job,
+    url: commentUrl,
+    postId: comment.id || statusIdFromUrl(commentUrl),
+    maxComments: remainingBudget,
+  }
+
+  try {
+    await page.goto(commentUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: job.timeoutMs || 45000,
+    })
+    await waitForRenderedPage(page, threadJob, warn)
+    await expandPostText(page, job.platform, job.waitMs || 1500)
+    if (await detectSignInBlockers(page, job.platform, warn)) {
+      markCommentCaptureIncomplete(commentCapture, 'sign_in_blocker')
+      return null
+    }
+
+    const expansion = await expandComments(page, threadJob, warn)
+    applyExpansionResult(commentCapture, expansion)
+
+    const currentUrl = page.url()
+    if (!pageMatchesRequestedPost(currentUrl, job.platform, threadJob.postId)) {
+      if (!job.followCommentRedirects) {
+        markCommentCaptureIncomplete(commentCapture, 'tree_redirect_not_followed')
+        warn(
+          `${platformName(job.platform)} redirected away from a comment URL at depth ${depth}; ` +
+            'stopped that branch.'
+        )
+        return null
+      }
+      commentCapture.redirects_followed.push(currentUrl)
+    }
+
+    return await extractPost(page, {
+      ...threadJob,
+      postId: statusIdFromUrl(currentUrl) || threadJob.postId,
+    })
+  } catch (err) {
+    markCommentCaptureIncomplete(commentCapture, 'tree_capture_error')
+    warn(`Could not capture replies for ${commentUrl}: ${errorMessage(err)}`)
+    return null
+  }
+}
+
+function enqueueComments(queue, comments, depth) {
+  for (const comment of comments || []) {
+    queue.push({ comment, depth })
+  }
+}
+
+function isPastMaxDepth(depth, maxDepth) {
+  return maxDepth !== null && maxDepth !== undefined && depth >= Number(maxDepth)
+}
+
+function mergePostComments(basePost, extraPost) {
+  if (!basePost.comments) basePost.comments = []
+  if (!extraPost || !Array.isArray(extraPost.comments)) return basePost
+  basePost.comments = mergeCommentLists(basePost.comments, extraPost.comments)
+  return basePost
+}
+
+function mergeCommentLists(existing, incoming) {
+  const existingByKey = new Map()
+  for (const comment of existing || []) {
+    existingByKey.set(commentKey(comment), comment)
+  }
+
+  for (const comment of incoming || []) {
+    const key = commentKey(comment)
+    const current = existingByKey.get(key)
+    if (current) {
+      current.replies = mergeCommentLists(current.replies || [], comment.replies || [])
+      continue
+    }
+    if (!comment.replies) comment.replies = []
+    existing.push(comment)
+    existingByKey.set(key, comment)
+  }
+  return existing
+}
+
+function commentKey(comment) {
+  if (!comment) return ''
+  return [
+    comment.id || '',
+    comment.url || '',
+    comment.author && comment.author.name ? comment.author.name : '',
+    comment.author && comment.author.handle ? comment.author.handle : '',
+    comment.posted_at || '',
+    comment.text || '',
+  ].join('|')
+}
+
+function countCommentTree(comments) {
+  let total = 0
+  for (const comment of comments || []) {
+    total += 1
+    total += countCommentTree(comment.replies || [])
+  }
+  return total
+}
+
+function remainingCommentBudget(rootPost, maxComments) {
+  if (!maxComments) return null
+  return Math.max(0, Number(maxComments) - countCommentTree(rootPost.comments || []))
+}
+
+function hasReachedCommentBudget(rootPost, maxComments) {
+  const remaining = remainingCommentBudget(rootPost, maxComments)
+  return remaining !== null && remaining <= 0
+}
+
+function hasReachedVisitBudget(commentCapture, maxVisits) {
+  if (!maxVisits) return false
+  return commentCapture.visited_comment_urls.length >= Number(maxVisits)
+}
+
+function limitComments(comments, budget) {
+  if (budget === null || budget === undefined) return comments || []
+  let remaining = Number(budget)
+  const output = []
+  for (const comment of comments || []) {
+    if (remaining <= 0) break
+    output.push(comment)
+    remaining -= 1
+    if (comment.replies && comment.replies.length) {
+      comment.replies = limitComments(comment.replies, remaining)
+      remaining -= countCommentTree(comment.replies)
+    }
+  }
+  return output
+}
+
+function setCommentDepths(comments, depth) {
+  for (const comment of comments || []) {
+    comment.depth = depth
+    setCommentDepths(comment.replies || [], depth + 1)
+  }
+}
+
+function canonicalUrl(url) {
+  if (!url) return null
+  try {
+    const parsed = new URL(url)
+    parsed.hash = ''
+    return parsed.href
+  } catch {
+    return String(url)
+  }
+}
+
+function statusIdFromUrl(url) {
+  const match = String(url || '').match(/\/status(?:es)?\/(\d+)/)
+  return match ? match[1] : null
 }
 
 async function runCapture() {

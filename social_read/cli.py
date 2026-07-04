@@ -75,6 +75,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum expansion/scroll rounds when --comments is enabled.",
     )
     capture_parser.add_argument(
+        "--follow-comment-redirects",
+        action="store_true",
+        help=(
+            "When comment expansion navigates away from the requested post, "
+            "continue from the redirected page and merge captured comments."
+        ),
+    )
+    capture_parser.add_argument(
+        "--comment-tree",
+        action="store_true",
+        help=(
+            "Visit captured comment URLs recursively to capture nested replies. "
+            "Implies --comments and --follow-comment-redirects."
+        ),
+    )
+    capture_parser.add_argument(
+        "--max-comment-depth",
+        type=int,
+        default=None,
+        help="Optional recursion depth cap for --comment-tree. Omit for no depth cap.",
+    )
+    capture_parser.add_argument(
+        "--max-comment-visits",
+        type=int,
+        default=None,
+        help="Optional cap on comment pages visited by --comment-tree.",
+    )
+    capture_parser.add_argument(
         "--headless",
         action="store_true",
         help="Create a new Playwriter headless session. Equivalent to --browser headless.",
@@ -166,9 +194,13 @@ def _capture(args: argparse.Namespace) -> int:
     config = CaptureConfig(
         url=args.url,
         output_dir=args.out.expanduser(),
-        include_comments=args.comments,
+        include_comments=args.comments or args.comment_tree,
         max_comments=args.max_comments,
         max_expansion_rounds=args.max_expansion_rounds,
+        follow_comment_redirects=args.follow_comment_redirects or args.comment_tree,
+        comment_tree=args.comment_tree,
+        max_comment_depth=args.max_comment_depth,
+        max_comment_visits=args.max_comment_visits,
         playwriter_command=args.playwriter_command,
         playwriter_session=args.session,
         playwriter_browser="headless" if args.headless else args.browser,

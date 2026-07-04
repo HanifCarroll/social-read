@@ -66,6 +66,10 @@ class CaptureConfig:
     include_comments: bool = False
     max_comments: int | None = None
     max_expansion_rounds: int = 200
+    follow_comment_redirects: bool = False
+    comment_tree: bool = False
+    max_comment_depth: int | None = None
+    max_comment_visits: int | None = None
     playwriter_command: str = "playwriter"
     playwriter_session: str = "auto"
     playwriter_browser: str | None = None
