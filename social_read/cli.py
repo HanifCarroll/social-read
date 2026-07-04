@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from playwright.async_api import Error, async_playwright
-
 from . import __version__
-from .browser import capture
+from .browser import PlaywriterError, capture, doctor
 from .models import CaptureConfig
 from .urls import UnsupportedUrlError, detect_platform
 
@@ -24,9 +21,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "doctor":
-        return asyncio.run(_doctor(json_output=args.json))
+        return _doctor(json_output=args.json, playwriter_command=args.playwriter_command)
     if args.command == "capture":
-        return asyncio.run(_capture(args))
+        return _capture(args)
 
     parser.print_help()
     return 2
@@ -35,14 +32,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="social-read",
-        description="Capture LinkedIn and X posts into structured artifacts with Playwright.",
+        description="Capture LinkedIn and X posts into structured artifacts with Playwriter.",
     )
     parser.add_argument("--version", action="version", version=f"social-read {__version__}")
 
     subparsers = parser.add_subparsers(dest="command")
 
-    doctor = subparsers.add_parser("doctor", help="Check Playwright import and browser launch.")
-    doctor.add_argument("--json", action="store_true", help="Print machine-readable output.")
+    doctor_parser = subparsers.add_parser("doctor", help="Check Playwriter availability.")
+    doctor_parser.add_argument(
+        "--playwriter-command",
+        default="playwriter",
+        help="Playwriter executable to use.",
+    )
+    doctor_parser.add_argument("--json", action="store_true", help="Print machine-readable output.")
 
     capture_parser = subparsers.add_parser(
         "capture",
@@ -75,29 +77,57 @@ def build_parser() -> argparse.ArgumentParser:
     capture_parser.add_argument(
         "--headless",
         action="store_true",
-        help="Run the browser headless. Headed mode is the default for login/session visibility.",
+        help="Create a new Playwriter headless session. Equivalent to --browser headless.",
     )
     capture_parser.add_argument(
-        "--browser-channel",
-        default="chrome",
+        "--session",
+        default="auto",
+        help="Existing Playwriter session ID to reuse, or 'auto' to create one for this run.",
+    )
+    capture_parser.add_argument(
+        "--browser",
+        choices=["headless", "cloud"],
+        default=None,
         help=(
-            "Playwright browser channel. Use 'chrome' for local Chrome or "
-            "'chromium' for bundled Chromium."
+            "Browser key for a newly created Playwriter session. "
+            "Omit to use Playwriter's default Chrome path."
         ),
     )
     capture_parser.add_argument(
-        "--profile-dir",
-        type=Path,
+        "--direct",
+        nargs="?",
+        const="1",
         default=None,
         help=(
-            "Persistent browser profile directory. Defaults to "
-            "~/.local/share/social-read/chrome-profile."
+            "Create a direct-CDP Playwriter session. "
+            "Optionally pass a ws://, wss://, or host:port endpoint."
         ),
     )
     capture_parser.add_argument(
-        "--cdp-url",
+        "--patchright",
+        action="store_true",
+        help="Pass --patchright when creating a new Playwriter session.",
+    )
+    capture_parser.add_argument(
+        "--proxy",
         default=None,
-        help="Attach to an existing Chromium debugging endpoint, e.g. http://127.0.0.1:9222.",
+        help="Proxy region for a newly created Playwriter cloud session, such as 'us'.",
+    )
+    capture_parser.add_argument(
+        "--playwriter-command",
+        default="playwriter",
+        help="Playwriter executable to use.",
+    )
+    capture_parser.add_argument(
+        "--playwriter-timeout-ms",
+        type=int,
+        default=600_000,
+        help="Maximum Playwriter script execution time in milliseconds.",
+    )
+    capture_parser.add_argument(
+        "--keep-session",
+        action="store_true",
+        help="Keep an auto-created Playwriter session after capture.",
     )
     capture_parser.add_argument(
         "--timeout-ms",
@@ -125,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _capture(args: argparse.Namespace) -> int:
+def _capture(args: argparse.Namespace) -> int:
     try:
         platform = detect_platform(args.url)
     except UnsupportedUrlError as exc:
@@ -139,10 +169,14 @@ async def _capture(args: argparse.Namespace) -> int:
         include_comments=args.comments,
         max_comments=args.max_comments,
         max_expansion_rounds=args.max_expansion_rounds,
-        headless=args.headless,
-        browser_channel=args.browser_channel,
-        profile_dir=args.profile_dir.expanduser() if args.profile_dir else None,
-        cdp_url=args.cdp_url,
+        playwriter_command=args.playwriter_command,
+        playwriter_session=args.session,
+        playwriter_browser="headless" if args.headless else args.browser,
+        playwriter_direct=args.direct,
+        playwriter_patchright=args.patchright,
+        playwriter_proxy=args.proxy,
+        playwriter_timeout_ms=args.playwriter_timeout_ms,
+        keep_session=args.keep_session,
         timeout_ms=args.timeout_ms,
         wait_ms=args.wait_ms,
         viewport_width=width,
@@ -151,9 +185,9 @@ async def _capture(args: argparse.Namespace) -> int:
     )
 
     try:
-        manifest = await capture(config)
-    except Error as exc:
-        print(f"social-read: Playwright error while capturing {platform}: {exc}", file=sys.stderr)
+        manifest = capture(config)
+    except PlaywriterError as exc:
+        print(f"social-read: Playwriter error while capturing {platform}: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:
         print(f"social-read: file error: {exc}", file=sys.stderr)
@@ -173,24 +207,11 @@ async def _capture(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _doctor(*, json_output: bool) -> int:
-    result = {
-        "ok": True,
-        "tool": "social-read",
-        "version": __version__,
-        "playwright_import": True,
-        "chromium_launch": None,
-        "warnings": [],
-    }
-    try:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            result["chromium_launch"] = True
-            await browser.close()
-    except Exception as exc:  # noqa: BLE001 - doctor should report environment failures.
-        result["ok"] = False
-        result["chromium_launch"] = False
-        result["warnings"].append(str(exc))
+def _doctor(*, json_output: bool, playwriter_command: str) -> int:
+    result = doctor(playwriter_command)
+    playwriter_version = result.pop("version", "")
+    result["version"] = __version__
+    result["playwriter_version"] = playwriter_version
 
     if json_output:
         print(json.dumps(result, indent=2))

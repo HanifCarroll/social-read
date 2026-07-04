@@ -1,75 +1,75 @@
 # Dogfooding Notes
 
-This file records CLI dogfooding rounds and the UX changes made after each run.
+This file records CLI dogfooding rounds and UX changes made after each run.
 
 ## Round Log
 
-### Round 1: Environment Check
+### Round 1: Playwriter Doctor
 
 - Command: `uv run social-read doctor --json`
-- Result: passed. Playwright import and bundled Chromium launch worked.
-- UX note: `pytest` needed `--extra dev` because dev dependencies are optional.
-- Change made: keep package dependencies lean; update docs/agent instructions to use the dev extra.
+- Result: passed with `/Users/hanifcarroll/.bun/bin/playwriter`.
+- UX note: doctor should report Playwriter version, session-list health, and active session count.
+- Change made: doctor now reports Playwriter-specific environment fields.
 
-### Round 2: X Basic Capture, First Pass
+### Round 2: Headless Session
 
-- Command: `uv run social-read "https://x.com/OpenAI/status/1932443370452037804" --out /tmp/social-read-dogfood/x-basic --browser-channel chromium --headless --json`
-- Result: artifacts were written, but `post.md` had no post text and warned that no tweet article matched.
-- UX note: a run with a visible post screenshot but empty structured content is not useful enough.
-- Change made: X extraction now supports current public X markup with `article[data-tweet-id]` and OpenGraph metadata for primary post text/author.
+- Command: `uv run social-read "https://x.com/OpenAI/status/1932443370452037804" --out /tmp/social-read-dogfood-playwriter/x-basic --headless --json`
+- Result: failed because Playwriter headless Chrome was not installed.
+- UX note: the error was actionable, but the README should mention the prerequisite.
+- Change made: README now documents `playwriter browser install` for `--headless`.
 
-### Round 3: X Basic Capture, Second Pass
+### Round 3: X Basic Capture, First Pass
 
-- Command: `uv run social-read "https://x.com/OpenAI/status/1932443370452037804" --out /tmp/social-read-dogfood/x-basic-2 --browser-channel chromium --headless --json`
-- Result: passed. `post.json`, `post.md`, and `screenshots/post.png` captured author, text, timestamp, URL, and visual context.
-- UX note: the basic capture output is readable and agent-usable.
-- Change made: none.
+- Command: `uv run social-read "https://x.com/OpenAI/status/2062927046448431587" --out /tmp/social-read-dogfood-playwriter/x-basic-2 --json`
+- Result: X redirected inside the logged-in browser before extraction, so no tweet article was captured.
+- UX note: final-URL drift should be explicit source context.
+- Change made: the manifest/post warnings now report when X redirects away from the requested status URL.
 
-### Round 4: X Comments Capture, First Pass
+### Round 4: X Basic Capture, Second Pass
 
-- Command: `uv run social-read "https://x.com/OpenAI/status/1932443370452037804" --out /tmp/social-read-dogfood/x-comments --browser-channel chromium --headless --comments --max-expansion-rounds 8 --json`
-- Result: completed with `comment_count: 0` and no warning, even though the page showed `Read 439 replies`.
-- UX note: comments mode needs to click X's `Read N replies` control and must warn when comments were requested but none were captured.
-- Change made: added the `Read N replies` expansion pattern and a zero-comments warning.
+- Command: `uv run social-read "https://x.com/OpenAI/status/2062927046448431587" --out /tmp/social-read-dogfood-playwriter/x-basic-3 --json`
+- Result: passed. Captured author, post text, timestamp, post id, full-page screenshot, and post screenshot.
+- UX note: auto-created Playwriter sessions should not accumulate.
+- Change made: verified auto-created sessions are deleted after successful runs unless `--keep-session` is passed.
 
-### Round 5: X Comments Capture, Second Pass
+### Round 5: X Comments Capture, First Pass
 
-- Command: `uv run social-read "https://x.com/OpenAI/status/1932443370452037804" --out /tmp/social-read-dogfood/x-comments-2 --browser-channel chromium --headless --comments --max-expansion-rounds 8 --json`
-- Result: completed with a zero-comments warning. Screenshot showed that X opened a login modal: `Join X now to read replies on this post.`
-- UX note: this is a platform/login blocker, not just an empty comment result. Screenshots should not remain obscured by the modal.
-- Change made: added X reply-login blocker detection and modal closing before screenshots.
+- Command: `uv run social-read "https://x.com/OpenAI/status/2062927046448431587" --out /tmp/social-read-dogfood-playwriter/x-comments --comments --max-expansion-rounds 8 --json`
+- Result: comment expansion redirected away from the requested status and lost the primary post.
+- UX note: comments mode must preserve the base post even when expansion drifts.
+- Change made: the Playwriter script now extracts the base post before expanding comments and restores the requested URL for screenshots when expansion redirects away.
 
-### Round 6: X Comments Capture, Third Pass
+### Round 6: X Comments Capture, Second Pass
 
-- Command: `uv run social-read "https://x.com/OpenAI/status/1932443370452037804" --out /tmp/social-read-dogfood/x-comments-3 --browser-channel chromium --headless --comments --max-expansion-rounds 8 --json`
-- Result: completed with explicit `X blocked reply capture behind a login modal.` warning and readable screenshots.
-- UX note: logged-out X cannot read replies from this page, but the blocker is now represented as source context instead of silent absence.
+- Command: `uv run social-read "https://x.com/OpenAI/status/2062927046448431587" --out /tmp/social-read-dogfood-playwriter/x-comments-2 --comments --max-expansion-rounds 8 --json`
+- Result: passed with the primary post, screenshots, and 19 captured replies. The warning explains that X redirected during further expansion.
+- UX note: this is a useful partial artifact because the limitation is explicit.
 - Change made: none.
 
 ### Round 7: LinkedIn Basic Capture, First Pass
 
-- Command: `uv run social-read "https://www.linkedin.com/posts/andresnds_github-openaigpt-oss-gpt-oss-120b-and-activity-7358548194995109888-wWMl" --out /tmp/social-read-dogfood/linkedin-basic --browser-channel chromium --headless --json`
-- Result: captured post text, but author name was missing, media included unrelated avatars/static assets, and screenshots were obscured by a sign-in modal.
-- UX note: public LinkedIn exposes better structured data than the visible DOM through `application/ld+json`.
-- Change made: LinkedIn extraction now prefers `SocialMediaPosting` JSON-LD for author, date, body, image, and public comments; screenshots now target `article.main-feed-activity-card`.
+- Command: `uv run social-read "https://www.linkedin.com/posts/andresnds_github-openaigpt-oss-gpt-oss-120b-and-activity-7358548194995109888-wWMl" --out /tmp/social-read-dogfood-playwriter/linkedin-basic --json`
+- Result: captured the post, but logged-in LinkedIn DOM produced noisy author and timestamp strings.
+- UX note: logged-in LinkedIn has cleaner actor fields than the broad actor container text.
+- Change made: LinkedIn extraction now prefers exact actor/timestamp selectors from the rendered DOM.
 
 ### Round 8: LinkedIn Basic Capture, Second Pass
 
-- Command: `uv run social-read "https://www.linkedin.com/posts/andresnds_github-openaigpt-oss-gpt-oss-120b-and-activity-7358548194995109888-wWMl" --out /tmp/social-read-dogfood/linkedin-basic-2 --browser-channel chromium --headless --json`
-- Result: author, timestamp, body, media, and screenshots were clean. LinkedIn's automatic sign-in modal was detected and closed.
-- UX note: basic capture should not click comment controls, because that creates unnecessary login prompts.
-- Change made: split post-text expansion controls from comment-expansion controls.
+- Command: `uv run social-read "https://www.linkedin.com/posts/andresnds_github-openaigpt-oss-gpt-oss-120b-and-activity-7358548194995109888-wWMl" --out /tmp/social-read-dogfood-playwriter/linkedin-basic-2 --json`
+- Result: passed with clean author, timestamp, post text, and screenshots.
+- UX note: structured artifacts are now readable without manual cleanup.
+- Change made: none.
 
 ### Round 9: LinkedIn Comments Capture
 
-- Command: `uv run social-read "https://www.linkedin.com/posts/andresnds_github-openaigpt-oss-gpt-oss-120b-and-activity-7358548194995109888-wWMl" --out /tmp/social-read-dogfood/linkedin-comments --browser-channel chromium --headless --comments --max-expansion-rounds 8 --json`
-- Result: captured all 8 public JSON-LD comments with no warnings.
-- UX note: logged-in runs may load comments beyond the initial schema.
-- Change made: merge schema comments with any loaded DOM comments and warn if LinkedIn declares more comments than captured.
+- Command: `uv run social-read "https://www.linkedin.com/posts/andresnds_github-openaigpt-oss-gpt-oss-120b-and-activity-7358548194995109888-wWMl" --out /tmp/social-read-dogfood-playwriter/linkedin-comments-2 --comments --max-expansion-rounds 8 --json`
+- Result: passed with 8 comments, clean author, screenshots, and no warnings.
+- UX note: comment capture stayed stable after the LinkedIn selector fix.
+- Change made: none.
 
-### Round 10: LinkedIn Comments Capture, Merge Check
+### Round 10: Session Cleanup Check
 
-- Command: `uv run social-read "https://www.linkedin.com/posts/andresnds_github-openaigpt-oss-gpt-oss-120b-and-activity-7358548194995109888-wWMl" --out /tmp/social-read-dogfood/linkedin-comments-2 --browser-channel chromium --headless --comments --max-expansion-rounds 8 --json`
-- Result: still captured 8 comments with no warnings after the merge change.
-- UX note: output is stable for the public LinkedIn case.
+- Command: `playwriter session list`
+- Result: no new `social-read` sessions remained after dogfooding.
+- UX note: default cleanup works; `--keep-session` remains available for debugging.
 - Change made: none.

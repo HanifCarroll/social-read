@@ -3,7 +3,8 @@
 `social-read` captures LinkedIn and X post URLs into structured artifacts that
 coding agents can read without improvising inside a social feed.
 
-It uses Playwright only. There is no LinkedIn API path and no X API path.
+It uses Playwriter to drive a browser session. There is no LinkedIn API path,
+no X API path, and no alternate Python browser backend.
 
 ## What It Produces
 
@@ -48,10 +49,10 @@ Or run without installing:
 uv run social-read doctor
 ```
 
-Install Playwright's bundled Chromium if needed:
+Install Playwriter if needed:
 
 ```sh
-uv run playwright install chromium
+npm install -g playwriter@latest
 ```
 
 ## Quick Start
@@ -76,31 +77,49 @@ Print the run manifest:
 social-read "https://x.com/user/status/123" --out ./captures/post --json
 ```
 
-## Browser Sessions
+## Playwriter Sessions
 
-By default, `social-read` opens headed Chrome with a persistent profile at:
+By default, `social-read` creates a temporary Playwriter session and lets
+Playwriter choose the browser path. In a normal local setup, that means the
+tool can use the Chrome instance exposed through Playwriter.
 
-```text
-~/.local/share/social-read/chrome-profile
+Reuse an existing Playwriter session:
+
+```sh
+playwriter session list
+social-read "https://x.com/user/status/123" \
+  --out ./captures/post \
+  --session 42
 ```
 
-Log into LinkedIn or X once in that profile, then later captures can reuse the
-session.
-
-Use bundled Chromium instead of local Chrome:
+Keep an auto-created session for later inspection:
 
 ```sh
 social-read "https://x.com/user/status/123" \
   --out ./captures/post \
-  --browser-channel chromium
+  --keep-session
 ```
 
-Attach to an existing Chromium debugging endpoint:
+Create a headless Playwriter session:
 
 ```sh
 social-read "https://x.com/user/status/123" \
   --out ./captures/post \
-  --cdp-url http://127.0.0.1:9222
+  --headless
+```
+
+If Playwriter reports that no Chrome browser was found for headless mode, run:
+
+```sh
+playwriter browser install
+```
+
+Use Playwriter direct-CDP mode:
+
+```sh
+social-read "https://x.com/user/status/123" \
+  --out ./captures/post \
+  --direct localhost:9222
 ```
 
 ## Comments
@@ -125,7 +144,7 @@ artifacts.
 
 | Command | Purpose |
 | --- | --- |
-| `social-read doctor` | Check Playwright and browser launch |
+| `social-read doctor` | Check Playwriter availability |
 | `social-read capture URL --out DIR` | Capture one LinkedIn or X post |
 | `social-read URL --out DIR` | Shorthand for `capture` |
 
@@ -143,9 +162,11 @@ Important options:
 | `--comments` | Expand and capture comments/replies |
 | `--max-comments N` | Cap extracted comments after expansion |
 | `--max-expansion-rounds N` | Cap comment expansion loop |
-| `--headless` | Run without a visible browser |
-| `--profile-dir DIR` | Use a specific persistent Chrome profile |
-| `--browser-channel chrome|chromium` | Choose local Chrome or bundled Chromium |
+| `--session ID` | Reuse an existing Playwriter session |
+| `--headless` | Create a Playwriter headless session |
+| `--browser headless|cloud` | Pick the browser key for a new Playwriter session |
+| `--direct [ENDPOINT]` | Create a direct-CDP Playwriter session |
+| `--keep-session` | Keep an auto-created Playwriter session |
 | `--save-html` | Save `raw/rendered.html` for debugging |
 
 ## Agent Workflow

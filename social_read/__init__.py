@@ -1,3 +1,3 @@
-"""Playwright-powered LinkedIn and X post reader."""
+"""Playwriter-powered LinkedIn and X post reader."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

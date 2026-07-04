@@ -2,103 +2,64 @@ from __future__ import annotations
 
 import json
 import re
-from contextlib import suppress
+import shutil
+import subprocess
+import tempfile
 from datetime import UTC, datetime
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from playwright.async_api import (
-    Browser,
-    BrowserContext,
-    Error,
-    Page,
-    TimeoutError,
-    async_playwright,
-)
-
-from .extractors import extract_post
+from .extractors import LINKEDIN_EXTRACTION_SCRIPT, X_EXTRACTION_SCRIPT, post_from_raw
 from .markdown import render_markdown
 from .models import CaptureConfig, CapturePaths, SocialPost, to_plain
 from .urls import default_post_id, detect_platform
 
-X_TEXT_EXPAND_BUTTONS = [
-    re.compile(r"^(show more|show this thread)$", re.I),
-]
-
-X_COMMENT_EXPAND_BUTTONS = [
-    re.compile(r"^(show more|show this thread|show replies|show more replies)$", re.I),
-    re.compile(r"^(show additional replies|view replies|view more replies)$", re.I),
-    re.compile(r"^read [\d,.km]+ replies$", re.I),
-]
-
-LINKEDIN_TEXT_EXPAND_BUTTONS = [
-    re.compile(r"^(see more)$", re.I),
-]
-
-LINKEDIN_COMMENT_EXPAND_BUTTONS = [
-    re.compile(r"^(see more)$", re.I),
-    re.compile(r"^(load more comments|show more comments|view previous comments)$", re.I),
-    re.compile(r"^(show previous comments|view replies|show replies|load more replies).*$", re.I),
-]
+RESULT_PREFIX = "SOCIAL_READ_RESULT "
 
 
-async def capture(config: CaptureConfig) -> dict[str, Any]:
+class PlaywriterError(RuntimeError):
+    pass
+
+
+def capture(config: CaptureConfig) -> dict[str, Any]:
     platform = detect_platform(config.url)
+    post_id = default_post_id(platform, config.url)
     paths = prepare_paths(config.output_dir)
     started_at = datetime.now(UTC).isoformat()
+    driver = PlaywriterDriver(
+        command=config.playwriter_command,
+        session=config.playwriter_session,
+        timeout_ms=config.playwriter_timeout_ms,
+        new_session_args=_new_session_args(config),
+        keep_session=config.keep_session,
+    )
 
-    async with async_playwright() as playwright:
-        context, browser, should_close_context = await _open_context(playwright, config)
-        page = await context.new_page()
-        page.set_default_timeout(config.timeout_ms)
-        warnings: list[str] = []
-        try:
-            response = await page.goto(
-                config.url,
-                wait_until="domcontentloaded",
-                timeout=config.timeout_ms,
-            )
-            if response is not None and response.status >= 400:
-                warnings.append(f"Initial navigation returned HTTP {response.status}.")
-            await page.wait_for_timeout(config.wait_ms)
+    raw_result: dict[str, Any] | None = None
+    cleanup_warning: str | None = None
+    try:
+        raw_result = driver.capture(_build_job(config, platform=platform, post_id=post_id), paths)
+    finally:
+        cleanup_warning = driver.close()
 
-            await _expand_post_text(page, platform=platform, wait_ms=config.wait_ms)
-            await _detect_sign_in_blockers(page, platform=platform, warnings=warnings)
-            if config.include_comments:
-                await _expand_comments(
-                    page,
-                    platform=platform,
-                    max_rounds=config.max_expansion_rounds,
-                    wait_ms=config.wait_ms,
-                    warnings=warnings,
-                )
-                await _detect_sign_in_blockers(page, platform=platform, warnings=warnings)
+    raw_post = raw_result.get("post") if isinstance(raw_result.get("post"), dict) else {}
+    post = post_from_raw(raw_post, platform=platform, requested_url=config.url, post_id=post_id)
+    post.warnings.extend(str(item) for item in raw_result.get("warnings", []) if item)
+    _add_redirect_warning(post, platform=platform, requested_url=config.url, post_id=post_id)
+    if cleanup_warning:
+        post.warnings.append(cleanup_warning)
+    post.screenshots.extend(str(item) for item in raw_result.get("screenshots", []) if item)
 
-            post = await extract_post(
-                page,
-                platform=platform,
-                requested_url=config.url,
-                include_comments=config.include_comments,
-                max_comments=config.max_comments,
-            )
-            post.warnings.extend(warnings)
-            if config.include_comments and _count_comments(post) == 0:
-                post.warnings.append(
-                    "Comments were requested, but no comments were captured. "
-                    "The page may require login, or no replies were loaded."
-                )
+    if config.include_comments and _count_comments(post) == 0:
+        post.warnings.append(
+            "Comments were requested, but no comments were captured. "
+            "The page may require login, or no replies were loaded."
+        )
 
-            await _write_screenshots(page, post, paths, config.url)
-            if config.save_html:
-                (paths.raw_dir / "rendered.html").write_text(await page.content(), encoding="utf-8")
-
-            _write_post_files(post, paths)
-            manifest = _build_manifest(config, post, paths, started_at)
-            paths.manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-            return manifest
-        finally:
-            await _close_page(page)
-            await _close_browser(context, browser, should_close_context)
+    _write_post_files(post, paths)
+    manifest = _build_manifest(config, post, paths, started_at, raw_result, driver.session)
+    paths.manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return manifest
 
 
 def prepare_paths(output_dir: Path) -> CapturePaths:
@@ -116,196 +77,176 @@ def prepare_paths(output_dir: Path) -> CapturePaths:
     )
 
 
-async def _open_context(
-    playwright: Any,
-    config: CaptureConfig,
-) -> tuple[BrowserContext, Browser | None, bool]:
-    viewport = {"width": config.viewport_width, "height": config.viewport_height}
-    if config.cdp_url:
-        browser = await playwright.chromium.connect_over_cdp(
-            config.cdp_url,
-            timeout=config.timeout_ms,
+class PlaywriterDriver:
+    def __init__(
+        self,
+        *,
+        command: str = "playwriter",
+        session: str = "auto",
+        timeout_ms: int = 600_000,
+        new_session_args: list[str] | None = None,
+        keep_session: bool = False,
+    ) -> None:
+        self.command = command
+        self.session = session
+        self.timeout_ms = timeout_ms
+        self.new_session_args = new_session_args or []
+        self.keep_session = keep_session
+        self.created_session = False
+
+    def start(self) -> None:
+        if self.session != "auto":
+            return
+        proc = subprocess.run(
+            [self.command, "session", "new", *self.new_session_args],
+            text=True,
+            capture_output=True,
+            check=False,
         )
-        if browser.contexts:
-            return browser.contexts[0], browser, False
-        context = await browser.new_context(viewport=viewport)
-        return context, browser, True
-
-    profile_dir = config.profile_dir or Path.home() / ".local/share/social-read/chrome-profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    channel = None if config.browser_channel == "chromium" else config.browser_channel
-    context = await playwright.chromium.launch_persistent_context(
-        user_data_dir=str(profile_dir),
-        channel=channel,
-        headless=config.headless,
-        viewport=viewport,
-    )
-    return context, None, True
-
-
-async def _expand_post_text(page: Page, *, platform: str, wait_ms: int) -> None:
-    patterns = X_TEXT_EXPAND_BUTTONS if platform == "x" else LINKEDIN_TEXT_EXPAND_BUTTONS
-    for _ in range(3):
-        clicked = await _click_matching_buttons(page, patterns, max_clicks=8)
-        if clicked == 0:
-            return
-        await page.wait_for_timeout(min(wait_ms, 1000))
-
-
-async def _expand_comments(
-    page: Page,
-    *,
-    platform: str,
-    max_rounds: int,
-    wait_ms: int,
-    warnings: list[str],
-) -> None:
-    patterns = X_COMMENT_EXPAND_BUTTONS if platform == "x" else LINKEDIN_COMMENT_EXPAND_BUTTONS
-    previous_signature: dict[str, Any] | None = None
-    stable_rounds = 0
-
-    for _ in range(max_rounds):
-        clicked = await _click_matching_buttons(page, patterns, max_clicks=20)
-        await page.mouse.wheel(0, 3000)
-        await page.wait_for_timeout(wait_ms)
-        signature = await _page_signature(page, platform=platform)
-
-        if signature == previous_signature and clicked == 0:
-            stable_rounds += 1
-        else:
-            stable_rounds = 0
-
-        previous_signature = signature
-        if stable_rounds >= 3:
-            break
-    else:
-        warnings.append(f"Stopped comment expansion after {max_rounds} rounds.")
-
-    await page.evaluate("window.scrollTo(0, 0)")
-    await page.wait_for_timeout(min(wait_ms, 1000))
-
-
-async def _detect_sign_in_blockers(page: Page, *, platform: str, warnings: list[str]) -> None:
-    if platform == "x":
-        blocker = page.get_by_text("Join X now to read replies on this post")
-        warning = "X blocked reply capture behind a login modal."
-    else:
-        blocker = page.get_by_text("Sign in to view more content")
-        warning = "LinkedIn opened a sign-in modal."
-
-    try:
-        if await blocker.count() == 0:
-            return
-        if not await blocker.first.is_visible(timeout=500):
-            return
-    except (Error, TimeoutError):
-        return
-
-    warnings.append(warning)
-    close_button = page.get_by_role("button", name=re.compile(r"^(close|x|dismiss)$", re.I))
-    try:
-        if await close_button.count() > 0:
-            await close_button.first.click(timeout=1200)
-        else:
-            await page.keyboard.press("Escape")
-        await page.wait_for_timeout(500)
-    except (Error, TimeoutError):
-        warnings.append(f"Could not close the {platform} sign-in modal before screenshots.")
-
-
-async def _click_matching_buttons(
-    page: Page,
-    patterns: list[re.Pattern[str]],
-    *,
-    max_clicks: int,
-) -> int:
-    clicks = 0
-    for pattern in patterns:
-        if clicks >= max_clicks:
-            break
-        locator = page.get_by_role("button", name=pattern)
-        try:
-            count = await locator.count()
-        except Error:
-            continue
-        for index in range(count):
-            if clicks >= max_clicks:
-                break
-            button = locator.nth(index)
-            try:
-                if not await button.is_visible(timeout=500):
-                    continue
-                if not await button.is_enabled(timeout=500):
-                    continue
-                await button.click(timeout=1200)
-                clicks += 1
-                await page.wait_for_timeout(250)
-            except (Error, TimeoutError):
-                continue
-    return clicks
-
-
-async def _page_signature(page: Page, *, platform: str) -> dict[str, Any]:
-    return await page.evaluate(
-        """
-        (platform) => {
-          const tweetCount = document.querySelectorAll(
-            'article[data-tweet-id], article[data-testid="tweet"], article'
-          ).length;
-          const commentCount = document.querySelectorAll(
-            ".comments-comment-item, .comments-comment-entity, [data-test-id='comment']"
-          ).length;
-          return {
-            platform,
-            tweetCount,
-            commentCount,
-            height: document.documentElement ? document.documentElement.scrollHeight : 0,
-            y: window.scrollY,
-          };
-        }
-        """,
-        platform,
-    )
-
-
-async def _write_screenshots(page: Page, post: SocialPost, paths: CapturePaths, url: str) -> None:
-    full_page = paths.screenshot_dir / "full-page.png"
-    await page.screenshot(path=str(full_page), full_page=True)
-    post.screenshots.append(str(full_page.relative_to(paths.output_dir)))
-
-    post_screenshot = paths.screenshot_dir / "post.png"
-    locator = _primary_post_locator(page, post.platform, url)
-    if locator is None:
-        post.warnings.append("Primary post screenshot locator was not available.")
-        return
-    try:
-        if await locator.count() == 0:
-            post.warnings.append("Primary post screenshot target was not found.")
-            return
-        await locator.first.screenshot(path=str(post_screenshot))
-        post.screenshots.append(str(post_screenshot.relative_to(paths.output_dir)))
-    except (Error, TimeoutError) as exc:
-        post.warnings.append(f"Primary post screenshot failed: {exc.__class__.__name__}.")
-
-
-def _primary_post_locator(page: Page, platform: str, url: str) -> Any:
-    post_id = default_post_id(platform, url)
-    if platform == "x":
-        if post_id:
-            return page.locator(
-                f'article[data-tweet-id="{post_id}"], a[href*="/status/{post_id}"]'
-            ).first.locator(
-                "xpath=ancestor-or-self::article[1]"
+        if proc.returncode != 0:
+            message = proc.stderr.strip() or proc.stdout.strip()
+            raise PlaywriterError(f"playwriter session new failed: {message}")
+        session_id = parse_new_session_id(proc.stdout)
+        if not session_id:
+            raise PlaywriterError(
+                f"could not parse playwriter session id from: {proc.stdout.strip()!r}"
             )
-        return page.locator('article[data-tweet-id], article[data-testid="tweet"], article')
+        self.session = session_id
+        self.created_session = True
 
-    if post_id and post_id.startswith("urn:li:"):
-        return page.locator(
-            f'article[data-activity-urn="{post_id}"], '
-            f'article[data-featured-activity-urn="{post_id}"], '
-            f'[data-urn="{post_id}"], [data-id="{post_id}"]'
+    def capture(self, job: dict[str, Any], paths: CapturePaths) -> dict[str, Any]:
+        self.start()
+        base_script = (
+            files("social_read").joinpath("playwriter_capture.js").read_text(encoding="utf-8")
         )
-    return page.locator("article.main-feed-activity-card, .feed-shared-update-v2, main")
+        temp_dir = Path(tempfile.mkdtemp(prefix="social-read-playwriter-"))
+        temp_script = temp_dir / "capture.js"
+        payload = {
+            **job,
+            "fullPageScreenshotPath": str(temp_dir / "full-page.png"),
+            "postScreenshotPath": str(temp_dir / "post.png"),
+            "htmlPath": str(temp_dir / "rendered.html"),
+        }
+        temp_script.write_text(
+            f"globalThis.SOCIAL_READ_JOB_OBJECT = {json.dumps(payload)};\n{base_script}",
+            encoding="utf-8",
+        )
+        try:
+            proc = subprocess.run(
+                [
+                    self.command,
+                    "-s",
+                    str(self.session),
+                    "--timeout",
+                    str(self.timeout_ms),
+                    "-f",
+                    str(temp_script),
+                ],
+                cwd=paths.output_dir,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            result = self._parse_result(proc.stdout)
+            self._move_temp_artifacts(temp_dir, paths, result)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if proc.returncode != 0:
+            process_error = (
+                proc.stderr.strip() or proc.stdout.strip() or f"playwriter exited {proc.returncode}"
+            )[-4000:]
+            if result.get("error"):
+                result.setdefault("warnings", []).append(process_error)
+            else:
+                result["error"] = process_error
+            result["ok"] = False
+        if result.get("error") and not result.get("post"):
+            raise PlaywriterError(str(result["error"]))
+        result["session"] = str(self.session)
+        return result
+
+    def close(self) -> str | None:
+        if not self.created_session or self.keep_session:
+            return None
+        proc = subprocess.run(
+            [self.command, "session", "delete", str(self.session)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return None
+        message = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        return f"Could not delete auto-created Playwriter session {self.session}: {message}"
+
+    def _parse_result(self, stdout: str) -> dict[str, Any]:
+        for line in reversed(stdout.splitlines()):
+            marker = line.find(RESULT_PREFIX)
+            if marker >= 0:
+                data = json.loads(line[marker + len(RESULT_PREFIX) :])
+                if not isinstance(data, dict):
+                    raise PlaywriterError("playwriter returned a non-object result")
+                return data
+        raise PlaywriterError(
+            "playwriter did not return a SOCIAL_READ_RESULT line"
+            + (f": {stdout[-4000:]}" if stdout else "")
+        )
+
+    def _move_temp_artifacts(
+        self, temp_dir: Path, paths: CapturePaths, result: dict[str, Any]
+    ) -> None:
+        artifact_moves = {
+            "fullPageScreenshotFile": (
+                temp_dir / "full-page.png",
+                paths.screenshot_dir / "full-page.png",
+            ),
+            "postScreenshotFile": (temp_dir / "post.png", paths.screenshot_dir / "post.png"),
+        }
+        screenshots: list[str] = []
+        for result_key, (source, destination) in artifact_moves.items():
+            relative_name = result.get(result_key)
+            if not relative_name or not source.exists():
+                continue
+            shutil.move(str(source), str(destination))
+            screenshots.append(str(destination.relative_to(paths.output_dir)))
+
+        if result.get("htmlFile") and (temp_dir / "rendered.html").exists():
+            shutil.move(str(temp_dir / "rendered.html"), str(paths.raw_dir / "rendered.html"))
+
+        result["screenshots"] = screenshots
+
+
+def _build_job(config: CaptureConfig, *, platform: str, post_id: str | None) -> dict[str, Any]:
+    return {
+        "url": config.url,
+        "platform": platform,
+        "postId": post_id,
+        "includeComments": config.include_comments,
+        "maxComments": config.max_comments,
+        "maxExpansionRounds": config.max_expansion_rounds,
+        "timeoutMs": config.timeout_ms,
+        "waitMs": config.wait_ms,
+        "viewport": {"width": config.viewport_width, "height": config.viewport_height},
+        "saveHtml": config.save_html,
+        "xExtractionScript": X_EXTRACTION_SCRIPT,
+        "linkedinExtractionScript": LINKEDIN_EXTRACTION_SCRIPT,
+    }
+
+
+def _new_session_args(config: CaptureConfig) -> list[str]:
+    args: list[str] = []
+    if config.playwriter_browser:
+        args.extend(["--browser", config.playwriter_browser])
+    if config.playwriter_direct:
+        args.append("--direct")
+        if config.playwriter_direct != "1":
+            args.append(config.playwriter_direct)
+    if config.playwriter_patchright:
+        args.append("--patchright")
+    if config.playwriter_proxy:
+        args.extend(["--proxy", config.playwriter_proxy])
+    return args
 
 
 def _write_post_files(post: SocialPost, paths: CapturePaths) -> None:
@@ -313,19 +254,50 @@ def _write_post_files(post: SocialPost, paths: CapturePaths) -> None:
     paths.post_md.write_text(render_markdown(post), encoding="utf-8")
 
 
+def _add_redirect_warning(
+    post: SocialPost, *, platform: str, requested_url: str, post_id: str | None
+) -> None:
+    if not post.final_url or post.final_url == requested_url:
+        return
+    if platform == "x" and post_id and f"/status/{post_id}" not in post.final_url:
+        post.warnings.append(
+            "X redirected away from the requested status URL before extraction; "
+            f"final URL was {post.final_url}."
+        )
+    if platform == "linkedin" and post_id and not _linkedin_final_url_matches(
+        post.final_url, post_id
+    ):
+        post.warnings.append(
+            "LinkedIn redirected away from the requested post URL before extraction; "
+            f"final URL was {post.final_url}."
+        )
+
+
+def _linkedin_final_url_matches(final_url: str, post_id: str) -> bool:
+    if post_id in final_url:
+        return True
+    match = re.search(r"(?:activity|share):(\d+)$", post_id)
+    return bool(match and match.group(1) in final_url)
+
+
 def _build_manifest(
     config: CaptureConfig,
     post: SocialPost,
     paths: CapturePaths,
     started_at: str,
+    raw_result: dict[str, Any],
+    session: str,
 ) -> dict[str, Any]:
     completed_at = datetime.now(UTC).isoformat()
     return {
-        "ok": True,
+        "ok": bool(raw_result.get("ok", True)),
         "tool": "social-read",
+        "driver": "playwriter",
+        "playwriter_session": session,
         "started_at": started_at,
         "completed_at": completed_at,
         "platform": post.platform,
+        "status": raw_result.get("status"),
         "url": config.url,
         "final_url": post.final_url,
         "comments_requested": config.include_comments,
@@ -348,20 +320,82 @@ def _count_comments(post: SocialPost) -> int:
     return count(post.comments)
 
 
-async def _close_page(page: Page) -> None:
-    with suppress(Error):
-        await page.close()
+def doctor(command: str = "playwriter") -> dict[str, Any]:
+    path = shutil.which(command)
+    if not path:
+        return {
+            "ok": False,
+            "tool": "social-read",
+            "driver": "playwriter",
+            "command": command,
+            "path": None,
+            "version": "",
+            "session_list_ok": False,
+            "active_session_count": 0,
+            "warnings": ["playwriter command not found"],
+        }
+
+    version = subprocess.run(
+        [command, "-v"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    sessions = subprocess.run(
+        [command, "session", "list"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    warnings = []
+    if version.returncode != 0:
+        warnings.append(
+            version.stderr.strip() or version.stdout.strip() or "playwriter version check failed"
+        )
+    if sessions.returncode != 0:
+        warnings.append(
+            sessions.stderr.strip() or sessions.stdout.strip() or "playwriter session list failed"
+        )
+
+    return {
+        "ok": version.returncode == 0 and sessions.returncode == 0,
+        "tool": "social-read",
+        "driver": "playwriter",
+        "command": command,
+        "path": path,
+        "version": first_version_line(version.stdout, version.stderr),
+        "session_list_ok": sessions.returncode == 0,
+        "active_session_count": count_sessions(sessions.stdout) if sessions.returncode == 0 else 0,
+        "warnings": warnings,
+    }
 
 
-async def _close_browser(
-    context: BrowserContext,
-    browser: Browser | None,
-    should_close_context: bool,
-) -> None:
-    if should_close_context:
-        with suppress(Error):
-            await context.close()
-    if browser is not None:
-        disconnect = getattr(browser, "disconnect", None)
-        if disconnect is not None:
-            await disconnect()
+def count_sessions(output: str) -> int:
+    count = 0
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("ID ") or set(stripped) == {"-"}:
+            continue
+        first = stripped.split(maxsplit=1)[0]
+        if first.isdigit() or re.match(r"^[A-Za-z0-9_.:-]+$", first):
+            count += 1
+    return count
+
+
+def first_version_line(stdout: str, stderr: str) -> str:
+    for line in f"{stdout}\n{stderr}".splitlines():
+        stripped = line.strip()
+        if stripped.startswith("playwriter/"):
+            return stripped
+    output = stdout.strip() or stderr.strip()
+    return output.splitlines()[0] if output else ""
+
+
+def parse_new_session_id(output: str) -> str | None:
+    match = re.search(r"\bSession\s+([A-Za-z0-9_.:-]+)\s+created\b", output)
+    if match:
+        return match.group(1)
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(lines) == 1 and re.match(r"^[A-Za-z0-9_.:-]+$", lines[0]):
+        return lines[0]
+    return None

@@ -1,20 +1,18 @@
 [project]
 name = "social-read"
-version = "0.1.0"
-description = "Playwright-powered LinkedIn and X post reader for agents."
+version = "0.1.1"
+description = "Playwriter-powered LinkedIn and X post reader for agents."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-keywords = ["agents", "linkedin", "playwright", "social", "x"]
+keywords = ["agents", "linkedin", "playwriter", "social", "x"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Topic :: Internet :: WWW/HTTP :: Browsers",
   "Topic :: Utilities",
 ]
-dependencies = [
-  "playwright>=1.45",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [

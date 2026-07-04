@@ -2,30 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from playwright.async_api import Page
-
 from .models import Author, Comment, MediaItem, Platform, SocialPost
-from .urls import default_post_id
 
 
-async def extract_post(
-    page: Page,
-    *,
-    platform: Platform,
-    requested_url: str,
-    include_comments: bool,
-    max_comments: int | None,
+def post_from_raw(
+    raw: dict[str, Any], *, platform: Platform, requested_url: str, post_id: str | None
 ) -> SocialPost:
-    post_id = default_post_id(platform, requested_url)
-    options = {
-        "requestedUrl": requested_url,
-        "postId": post_id,
-        "includeComments": include_comments,
-        "maxComments": max_comments,
-    }
-
-    script = X_EXTRACTION_SCRIPT if platform == "x" else LINKEDIN_EXTRACTION_SCRIPT
-    raw = await page.evaluate(script, options)
     return _post_from_raw(raw, platform=platform, requested_url=requested_url, post_id=post_id)
 
 
@@ -451,6 +433,10 @@ LINKEDIN_EXTRACTION_SCRIPT = r"""
     name:
       (schemaAuthor && schemaAuthor.name) ||
       firstText(root, [
+        ".update-components-actor__title span[aria-hidden='true']",
+        ".feed-shared-actor__name span[aria-hidden='true']",
+        '[data-test-id="main-feed-activity-card__entity-lockup"] ' +
+          'a[aria-label] span[aria-hidden="true"]',
         '[data-tracking-control-name="public_post_feed-actor-name"]',
         '[data-test-id="main-feed-activity-card__entity-lockup"] a[aria-label]',
         ".update-components-actor__name",
@@ -494,12 +480,17 @@ LINKEDIN_EXTRACTION_SCRIPT = r"""
     options.postId ||
     null;
 
-  const timeNode = root
-    ? root.querySelector(
-        "time, .update-components-actor__sub-description, " +
-          ".feed-shared-actor__sub-description"
-      )
-    : null;
+  const timeNode = root ? root.querySelector("time") : null;
+  const postedAtText =
+    (timeNode && timeNode.getAttribute("datetime")) ||
+    firstText(root, [
+      ".update-components-actor__sub-description .visually-hidden",
+      ".feed-shared-actor__sub-description .visually-hidden",
+      ".update-components-actor__sub-description span[aria-hidden='true']",
+      ".feed-shared-actor__sub-description span[aria-hidden='true']",
+      ".update-components-actor__sub-description",
+      ".feed-shared-actor__sub-description",
+    ]);
 
   let media = schemaImages(schema && schema.image);
   if (root) {
@@ -636,7 +627,7 @@ LINKEDIN_EXTRACTION_SCRIPT = r"""
     final_url: document.location.href,
     post_id: postId,
     author,
-    posted_at: (schema && schema.datePublished) || clean(timeNode && timeNode.textContent),
+    posted_at: (schema && schema.datePublished) || postedAtText,
     text: postText,
     media,
     quoted_or_shared_post: null,
