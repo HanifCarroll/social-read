@@ -1,0 +1,14 @@
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+build/
+
+# Local browser/session state and captured social content.
+.social-read/
+captures/
+output/
+tmp/
