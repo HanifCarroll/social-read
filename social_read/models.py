@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-Platform = Literal["linkedin", "x"]
+Platform = Literal["linkedin", "reddit", "x"]
 
 
 @dataclass

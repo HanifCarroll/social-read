@@ -1,11 +1,11 @@
 [project]
 name = "social-read"
 version = "0.1.2"
-description = "Playwriter-powered LinkedIn and X post reader for agents."
+description = "Playwriter-powered LinkedIn, Reddit, and X post reader for agents."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-keywords = ["agents", "linkedin", "playwriter", "social", "x"]
+keywords = ["agents", "linkedin", "playwriter", "reddit", "social", "x"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
@@ -29,6 +29,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["social_read"]
+artifacts = ["social_read/playwriter_capture.js"]
 
 [tool.ruff]
 line-length = 100

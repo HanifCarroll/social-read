@@ -67,7 +67,8 @@ def render_markdown(post: SocialPost) -> str:
 
 
 def _title(post: SocialPost) -> str:
-    platform_name = "LinkedIn" if post.platform == "linkedin" else "X"
+    platform_names = {"linkedin": "LinkedIn", "reddit": "Reddit", "x": "X"}
+    platform_name = platform_names.get(post.platform, post.platform)
     author = post.author.name or post.author.handle
     if author:
         return f"{platform_name} post by {author}"

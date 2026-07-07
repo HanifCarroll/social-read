@@ -1,3 +1,4 @@
+from importlib.resources import files
 from pathlib import Path
 
 from social_read.browser import (
@@ -34,6 +35,17 @@ def test_parse_result_with_log_prefix() -> None:
     assert result["ok"] is True
 
 
+def test_parse_result_from_file_prefix(tmp_path: Path) -> None:
+    driver = PlaywriterDriver(session="1")
+    result_file = tmp_path / "result.json"
+    result_file.write_text('{"url":"https://example.com/","ok":true,"post":{}}\n')
+    stdout = f"[log] SOCIAL_READ_RESULT_FILE {result_file}\n"
+
+    result = driver._parse_result(stdout)
+
+    assert result["ok"] is True
+
+
 def test_prepare_paths_creates_expected_dirs(tmp_path: Path) -> None:
     paths = prepare_paths(tmp_path / "capture")
 
@@ -59,6 +71,34 @@ def test_build_job_includes_comment_tree_options(tmp_path: Path) -> None:
     assert job["commentTree"] is True
     assert job["maxCommentDepth"] == 3
     assert job["maxCommentVisits"] == 7
+
+
+def test_build_job_includes_reddit_extraction_script(tmp_path: Path) -> None:
+    config = CaptureConfig(
+        url="https://www.reddit.com/r/FacebookAds/comments/1t0te6o/example/",
+        output_dir=tmp_path,
+    )
+
+    job = _build_job(
+        config,
+        platform="reddit",
+        post_id="t3_1t0te6o",
+        navigation_url="https://old.reddit.com/r/FacebookAds/comments/1t0te6o/example/",
+    )
+
+    assert job["platform"] == "reddit"
+    assert job["navigationUrl"].startswith("https://old.reddit.com/")
+    assert "REDDIT_EXTRACTION_SCRIPT" not in job["redditExtractionScript"]
+    assert ".thing.link" in job["redditExtractionScript"]
+
+
+def test_packaged_capture_script_includes_reddit_tree_helpers() -> None:
+    script = files("social_read").joinpath("playwriter_capture.js").read_text(encoding="utf-8")
+
+    assert "pruneAncestorDuplicateComments" in script
+    assert "parseRedditThingId" in script
+    assert "expandRedditComments" in script
+    assert "reddit_morechildren_remaining" in script
 
 
 def test_manifest_includes_comment_capture_metadata(tmp_path: Path) -> None:

@@ -26,3 +26,16 @@ def test_render_markdown_includes_nested_comments_and_warnings() -> None:
     assert "1. Commenter" in output
     assert "Nested reply" in output
     assert "Partial comments captured." in output
+
+
+def test_render_markdown_uses_reddit_title() -> None:
+    post = SocialPost(
+        platform="reddit",
+        url="https://www.reddit.com/r/test/comments/abc/example/",
+        author=Author(handle="u/example"),
+        text="Post body",
+    )
+
+    output = render_markdown(post)
+
+    assert output.startswith("# Reddit post by u/example")

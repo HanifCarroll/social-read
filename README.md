@@ -1,10 +1,10 @@
 # social-read
 
-`social-read` captures LinkedIn and X post URLs into structured artifacts that
+`social-read` captures LinkedIn, Reddit, and X post URLs into structured artifacts that
 coding agents can read without improvising inside a social feed.
 
 It uses Playwriter to drive a browser session. There is no LinkedIn API path,
-no X API path, and no alternate Python browser backend.
+no Reddit API path, no X API path, and no alternate Python browser backend.
 
 ## What It Produces
 
@@ -61,6 +61,14 @@ Capture a post:
 
 ```sh
 social-read "https://x.com/user/status/123" --out ./captures/post
+```
+
+Capture a public Reddit post:
+
+```sh
+social-read "https://www.reddit.com/r/FacebookAds/comments/1t0te6o/example/" \
+  --out ./captures/reddit-post \
+  --comments
 ```
 
 Capture comments and replies too:
@@ -125,7 +133,9 @@ social-read "https://x.com/user/status/123" \
 ## Comments
 
 `--comments` repeatedly clicks visible expansion controls and scrolls until the
-page stops yielding new comment/reply nodes.
+page stops yielding new comment/reply nodes. For Reddit, the tool captures the
+public old.reddit.com rendering and clicks native `load more comments` controls
+(`.thing[data-type="morechildren"] .morecomments > a.button`) before extraction.
 
 Useful bounds:
 
@@ -143,8 +153,9 @@ social-read URL \
   --follow-comment-redirects
 ```
 
-Capture a recursive comment tree by visiting captured comment URLs and attaching
-their replies under the parent comment:
+Use recursive comment URL traversal only when the captured platform page still
+has unresolved branches or when you need a deeper verification pass. It visits
+captured comment permalinks and attaches their replies under the parent comment:
 
 ```sh
 social-read URL \
@@ -174,7 +185,7 @@ artifacts.
 | Command | Purpose |
 | --- | --- |
 | `social-read doctor` | Check Playwriter availability |
-| `social-read capture URL --out DIR` | Capture one LinkedIn or X post |
+| `social-read capture URL --out DIR` | Capture one LinkedIn, Reddit, or X post |
 | `social-read URL --out DIR` | Shorthand for `capture` |
 
 ## Development
@@ -209,6 +220,10 @@ Important options:
 3. Add `--comments` when the task needs the discussion, not just the post.
 4. Read `post.json` first, then `post.md`, then screenshots if visual context matters.
 5. Treat `warnings` as part of the source record.
+
+For Reddit URLs, `social-read` captures the public old.reddit.com rendering of
+the requested post URL when possible. This keeps capture browser-only while
+avoiding Reddit's unauthenticated verification page on the default web host.
 
 ## Privacy
 

@@ -2,9 +2,11 @@ import pytest
 
 from social_read.urls import (
     UnsupportedUrlError,
+    default_navigation_url,
     default_post_id,
     detect_platform,
     extract_linkedin_post_id,
+    extract_reddit_post_id,
     extract_x_post_id,
 )
 
@@ -20,6 +22,17 @@ def test_detect_platform_for_linkedin_hosts() -> None:
         == "linkedin"
     )
     assert detect_platform("https://www.linkedin.com/posts/example") == "linkedin"
+
+
+def test_detect_platform_for_reddit_hosts() -> None:
+    assert (
+        detect_platform("https://www.reddit.com/r/FacebookAds/comments/1t0te6o/example/")
+        == "reddit"
+    )
+    assert (
+        detect_platform("https://old.reddit.com/r/FacebookAds/comments/1t0te6o/example/")
+        == "reddit"
+    )
 
 
 def test_detect_platform_rejects_other_hosts() -> None:
@@ -43,8 +56,26 @@ def test_extract_linkedin_post_id_from_public_post_slug() -> None:
     assert extract_linkedin_post_id(url) == "urn:li:activity:7358548194995109888"
 
 
+def test_extract_reddit_post_id() -> None:
+    url = "https://www.reddit.com/r/FacebookAds/comments/1t0te6o/example/"
+    assert extract_reddit_post_id(url) == "t3_1t0te6o"
+
+
+def test_default_navigation_url_uses_old_reddit_for_reddit() -> None:
+    url = "https://www.reddit.com/r/FacebookAds/comments/1t0te6o/example/"
+    assert (
+        default_navigation_url("reddit", url)
+        == "https://old.reddit.com/r/FacebookAds/comments/1t0te6o/example/"
+    )
+    assert default_navigation_url("x", "https://x.com/u/status/1") == "https://x.com/u/status/1"
+
+
 def test_default_post_id_routes_by_platform() -> None:
     assert default_post_id("x", "https://x.com/a/status/42") == "42"
+    assert (
+        default_post_id("reddit", "https://www.reddit.com/r/FacebookAds/comments/1t0te6o/x/")
+        == "t3_1t0te6o"
+    )
     assert (
         default_post_id("linkedin", "https://www.linkedin.com/feed/update/urn:li:activity:42/")
         == "urn:li:activity:42"

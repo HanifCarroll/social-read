@@ -285,6 +285,182 @@ X_EXTRACTION_SCRIPT = r"""
 """
 
 
+REDDIT_EXTRACTION_SCRIPT = r"""
+(options) => {
+  const warnings = [];
+
+  const clean = (value) => {
+    const text = value == null ? "" : String(value);
+    const compact = text.replace(/\u00a0/g, " ").replace(/[ \t\r\f\v]+/g, " ").trim();
+    return compact.length ? compact : null;
+  };
+
+  const cleanBlock = (value) => {
+    const text = value == null ? "" : String(value);
+    const compact = text
+      .replace(/\u00a0/g, " ")
+      .replace(/[ \t\r\f\v]+/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    return compact.length ? compact : null;
+  };
+
+  const absoluteUrl = (href) => {
+    if (!href) return null;
+    try {
+      return new URL(href, document.location.href).href;
+    } catch {
+      return href;
+    }
+  };
+
+  const blockText = (root) => {
+    if (!root) return null;
+    const parts = [];
+    const walk = (node) => {
+      if (!node) return;
+      if (node.nodeType === Node.TEXT_NODE) {
+        parts.push(node.nodeValue || "");
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const tag = node.tagName.toLowerCase();
+      if (["br", "p", "li", "blockquote", "div"].includes(tag)) parts.push("\n");
+      for (const child of Array.from(node.childNodes)) walk(child);
+      if (["p", "li", "blockquote", "div"].includes(tag)) parts.push("\n");
+    };
+    walk(root);
+    return cleanBlock(parts.join(""));
+  };
+
+  const directChild = (node, className) =>
+    Array.from(node ? node.children : []).find((child) => child.classList.contains(className)) ||
+    null;
+
+  const commentKey = (comment) =>
+    [
+      comment.url || "",
+      comment.author && comment.author.handle ? comment.author.handle : "",
+      comment.posted_at || "",
+      comment.text || "",
+    ].join("|");
+  const redditHandle = (name) => (name ? `/u/${name.replace(/^\/?u\//, "")}` : null);
+  const redditThingId = (value) => {
+    const text = clean(value);
+    return text ? text.replace(/^thing_/, "") : null;
+  };
+
+  const post = document.querySelector('.thing.link[data-fullname^="t3_"]');
+  if (!post) warnings.push("No old.reddit post container matched .thing.link[data-fullname].");
+
+  const postEntry = directChild(post, "entry") || post;
+  const titleNode = postEntry ? postEntry.querySelector("a.title") : null;
+  const title = clean(titleNode && titleNode.textContent);
+  if (!title) warnings.push("No Reddit post title was captured from a.title.");
+
+  const bodyNode = postEntry ? postEntry.querySelector(".usertext-body .md") : null;
+  const body = blockText(bodyNode);
+  if (!body) warnings.push("No Reddit post body text was captured from .usertext-body .md.");
+
+  const authorNode = postEntry ? postEntry.querySelector(".tagline a.author") : null;
+  const timeNode = postEntry ? postEntry.querySelector(".tagline time") : null;
+  const commentsLink = postEntry ? postEntry.querySelector('a.comments[href]') : null;
+  const subredditNode = document.querySelector(".pagename a");
+
+  const postText = [title, body].filter(Boolean).join("\n\n") || null;
+  const postId = post ? redditThingId(post.getAttribute("data-fullname")) : options.postId || null;
+
+  const extractComment = (node) => {
+    const entry = directChild(node, "entry") || node;
+    const commentAuthor = entry.querySelector(".tagline a.author");
+    const commentTime = entry.querySelector(".tagline time");
+    const permalink = entry.querySelector('a.bylink[href]');
+    const textNode = entry.querySelector(".usertext-body .md");
+    const id = redditThingId(node.getAttribute("data-fullname") || node.getAttribute("id"));
+    return {
+      id,
+      url: absoluteUrl(permalink && permalink.getAttribute("href")),
+      author: {
+        name: clean(commentAuthor && commentAuthor.textContent),
+        handle: redditHandle(clean(commentAuthor && commentAuthor.textContent)),
+        url: absoluteUrl(commentAuthor && commentAuthor.getAttribute("href")),
+      },
+      posted_at: commentTime ? commentTime.getAttribute("datetime") : null,
+      text: blockText(textNode),
+      media: [],
+      replies: [],
+      depth: 0,
+    };
+  };
+
+  const comments = [];
+  if (options.includeComments) {
+    let commentNodes = Array.from(document.querySelectorAll(".commentarea .thing.comment"));
+    const originalCount = commentNodes.length;
+    if (options.maxComments && commentNodes.length > Number(options.maxComments)) {
+      commentNodes = commentNodes.slice(0, Number(options.maxComments));
+      warnings.push(`Stopped Reddit comment extraction after maxComments=${options.maxComments}.`);
+    }
+
+    const commentsById = new Map();
+    const parentById = new Map();
+    for (const node of commentNodes) {
+      const comment = extractComment(node);
+      const parentNode = node.parentElement ? node.parentElement.closest(".thing.comment") : null;
+      const parentId = parentNode
+        ? redditThingId(parentNode.getAttribute("data-fullname") || parentNode.getAttribute("id"))
+        : null;
+      const id = comment.id || commentKey(comment);
+      commentsById.set(id, comment);
+      parentById.set(id, parentId);
+    }
+
+    for (const node of commentNodes) {
+      const id = redditThingId(node.getAttribute("data-fullname") || node.getAttribute("id"));
+      const comment = commentsById.get(id);
+      if (!comment) continue;
+      const parentId = parentById.get(id);
+      const parent = parentId ? commentsById.get(parentId) : null;
+      if (parent) {
+        comment.depth = (parent.depth || 0) + 1;
+        parent.replies.push(comment);
+      } else {
+        comment.depth = 0;
+        comments.push(comment);
+      }
+    }
+
+    if (originalCount === 0) {
+      warnings.push("Comments were requested, but no old.reddit comments were present.");
+    }
+    if (document.querySelector(".morecomments")) {
+      warnings.push(
+        "Reddit page indicates additional comments were not loaded in the static page."
+      );
+    }
+  }
+
+  return {
+    final_url: document.location.href,
+    post_id: postId,
+    author: {
+      name: clean(authorNode && authorNode.textContent),
+      handle: redditHandle(clean(authorNode && authorNode.textContent)),
+      url: absoluteUrl(authorNode && authorNode.getAttribute("href")),
+    },
+    posted_at: timeNode ? timeNode.getAttribute("datetime") : null,
+    subreddit: clean(subredditNode && subredditNode.textContent),
+    text: postText,
+    media: [],
+    quoted_or_shared_post: null,
+    comments,
+    url: absoluteUrl(commentsLink && commentsLink.getAttribute("href")) || options.requestedUrl,
+    warnings,
+  };
+}
+"""
+
+
 LINKEDIN_EXTRACTION_SCRIPT = r"""
 (options) => {
   const warnings = [];

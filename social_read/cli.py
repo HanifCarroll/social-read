@@ -32,7 +32,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="social-read",
-        description="Capture LinkedIn and X posts into structured artifacts with Playwriter.",
+        description=(
+            "Capture LinkedIn, Reddit, and X posts into structured artifacts with Playwriter."
+        ),
     )
     parser.add_argument("--version", action="version", version=f"social-read {__version__}")
 
@@ -48,9 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     capture_parser = subparsers.add_parser(
         "capture",
-        help="Capture one LinkedIn or X post URL.",
+        help="Capture one LinkedIn, Reddit, or X post URL.",
     )
-    capture_parser.add_argument("url", help="LinkedIn or X post URL.")
+    capture_parser.add_argument("url", help="LinkedIn, Reddit, or X post URL.")
     capture_parser.add_argument(
         "--out",
         required=True,
@@ -86,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--comment-tree",
         action="store_true",
         help=(
-            "Visit captured comment URLs recursively to capture nested replies. "
+            "Visit captured comment URLs recursively for fallback/deep reply capture. "
             "Implies --comments and --follow-comment-redirects."
         ),
     )

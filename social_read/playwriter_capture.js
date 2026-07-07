@@ -16,6 +16,11 @@ const LINKEDIN_COMMENT_EXPAND_BUTTONS = [
   /^(show previous comments|view replies|show replies|load more replies).*$/i,
 ]
 
+const REDDIT_TEXT_EXPAND_BUTTONS = []
+const REDDIT_COMMENT_EXPAND_BUTTONS = []
+const REDDIT_MORE_COMMENTS_SELECTOR =
+  '.commentarea .thing[data-type="morechildren"] .morecomments > a.button'
+
 function loadJob() {
   if (globalThis.SOCIAL_READ_JOB_OBJECT) return globalThis.SOCIAL_READ_JOB_OBJECT
   const envJob = process.env.SOCIAL_READ_JOB
@@ -64,7 +69,7 @@ async function main() {
     }
 
     try {
-      const response = await capturePage.goto(job.url, {
+      const response = await capturePage.goto(job.navigationUrl || job.url, {
         waitUntil: 'domcontentloaded',
         timeout: job.timeoutMs || 45000,
       })
@@ -111,7 +116,7 @@ async function main() {
         try {
           const redirectedPost = await extractPost(capturePage, {
             ...job,
-            postId: statusIdFromUrl(redirectedUrl) || job.postId,
+            postId: postIdFromUrl(redirectedUrl, job.platform) || job.postId,
           })
           mergePostComments(rawPost, redirectedPost)
         } catch (err) {
@@ -218,7 +223,12 @@ async function waitForRenderedPage(page, job, warn) {
 }
 
 async function extractPost(page, job) {
-  const extractionSource = job.platform === 'x' ? job.xExtractionScript : job.linkedinExtractionScript
+  const extractionSource = {
+    x: job.xExtractionScript,
+    linkedin: job.linkedinExtractionScript,
+    reddit: job.redditExtractionScript,
+  }[job.platform]
+  if (!extractionSource) throw new Error(`Unsupported platform: ${job.platform}`)
   const extractionFunction = eval(extractionSource)
   return await page.evaluate(extractionFunction, {
     requestedUrl: job.url,
@@ -244,7 +254,11 @@ async function extractBasePost(page, job, warn) {
 }
 
 async function expandPostText(page, platform, waitMs) {
-  const patterns = platform === 'x' ? X_TEXT_EXPAND_BUTTONS : LINKEDIN_TEXT_EXPAND_BUTTONS
+  const patterns = {
+    x: X_TEXT_EXPAND_BUTTONS,
+    linkedin: LINKEDIN_TEXT_EXPAND_BUTTONS,
+    reddit: REDDIT_TEXT_EXPAND_BUTTONS,
+  }[platform] || []
   for (let round = 0; round < 3; round += 1) {
     const clicked = await clickMatchingButtons(page, patterns, 8)
     if (clicked === 0) return
@@ -253,7 +267,15 @@ async function expandPostText(page, platform, waitMs) {
 }
 
 async function expandComments(page, job, warn) {
-  const patterns = job.platform === 'x' ? X_COMMENT_EXPAND_BUTTONS : LINKEDIN_COMMENT_EXPAND_BUTTONS
+  if (job.platform === 'reddit') {
+    return await expandRedditComments(page, job, warn)
+  }
+
+  const patterns = {
+    x: X_COMMENT_EXPAND_BUTTONS,
+    linkedin: LINKEDIN_COMMENT_EXPAND_BUTTONS,
+    reddit: REDDIT_COMMENT_EXPAND_BUTTONS,
+  }[job.platform] || []
   let previousSignature = null
   let stableRounds = 0
   const maxRounds = Number(job.maxExpansionRounds || 200)
@@ -288,7 +310,105 @@ async function expandComments(page, job, warn) {
   return result
 }
 
+async function expandRedditComments(page, job, warn) {
+  const maxRounds = Number(job.maxExpansionRounds || 200)
+  const result = {
+    completed: true,
+    rounds: 0,
+    clicks: 0,
+    reddit_morechildren_remaining: null,
+    stopped_reason: null,
+  }
+
+  for (let round = 0; round < maxRounds; round += 1) {
+    const before = await redditCommentExpansionState(page)
+    if (before.morechildren === 0) {
+      break
+    }
+
+    result.rounds = round + 1
+    const clicked = await clickOneRedditMoreCommentsButton(page)
+    if (!clicked) {
+      result.completed = false
+      result.stopped_reason = 'reddit_morecomments_click_failed'
+      warn('Stopped Reddit comment expansion because a load-more-comments control could not be clicked.')
+      break
+    }
+    result.clicks += 1
+
+    await waitForRedditMoreCommentsChange(page, before, Number(job.waitMs || 1500))
+  }
+
+  const after = await redditCommentExpansionState(page)
+  result.reddit_morechildren_remaining = after.morechildren
+  if (after.morechildren > 0 && result.completed) {
+    result.completed = false
+    result.stopped_reason = 'max_expansion_rounds'
+    warn(
+      `Stopped Reddit comment expansion after ${maxRounds} load-more-comments clicks; ` +
+        `${after.morechildren} morechildren controls remain.`
+    )
+  }
+
+  try {
+    await page.evaluate(() => window.scrollTo(0, 0))
+    await page.waitForTimeout(Math.min(Number(job.waitMs || 1500), 1000))
+  } catch {}
+  return result
+}
+
+async function redditCommentExpansionState(page) {
+  return await page.evaluate((selector) => ({
+    comments: document.querySelectorAll('.commentarea .thing.comment').length,
+    morechildren: document.querySelectorAll(selector).length,
+  }), REDDIT_MORE_COMMENTS_SELECTOR)
+}
+
+async function clickOneRedditMoreCommentsButton(page) {
+  const locator = page.locator(REDDIT_MORE_COMMENTS_SELECTOR).first()
+  try {
+    if ((await locator.count()) === 0) return false
+    if (!(await locator.isVisible({ timeout: 500 }))) return false
+    await locator.click({ timeout: 5000 })
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function waitForRedditMoreCommentsChange(page, before, waitMs) {
+  const timeout = Math.max(5000, Math.min(Number(waitMs || 1500) * 4, 15000))
+  try {
+    await page.waitForFunction(
+      ({ selector, previousComments, previousMorechildren }) => {
+        const comments = document.querySelectorAll('.commentarea .thing.comment').length
+        const morechildren = document.querySelectorAll(selector).length
+        return comments !== previousComments || morechildren !== previousMorechildren
+      },
+      {
+        selector: REDDIT_MORE_COMMENTS_SELECTOR,
+        previousComments: before.comments,
+        previousMorechildren: before.morechildren,
+      },
+      { timeout }
+    )
+  } catch {
+    await page.waitForTimeout(Math.min(Number(waitMs || 1500), 2000))
+  }
+}
+
 async function detectSignInBlockers(page, platform, warn) {
+  if (platform === 'reddit') {
+    try {
+      const title = await page.locator('title').first().textContent({ timeout: 500 })
+      if (title && /please wait for verification/i.test(title)) {
+        warn('Reddit opened a verification page instead of the public post.')
+        return true
+      }
+    } catch {}
+    return false
+  }
+
   const text = platform === 'x'
     ? 'Join X now to read replies on this post'
     : 'Sign in to view more content'
@@ -377,6 +497,14 @@ function primaryPostLocator(page, platform, postId) {
     return page.locator('article[data-tweet-id], article[data-testid="tweet"], article')
   }
 
+  if (platform === 'reddit') {
+    if (postId) {
+      const id = cssString(postId)
+      return page.locator(`.thing.link[data-fullname="${id}"]`)
+    }
+    return page.locator('.thing.link[data-fullname^="t3_"]')
+  }
+
   if (postId && String(postId).startsWith('urn:li:')) {
     const id = cssString(postId)
     return page.locator(
@@ -389,12 +517,26 @@ function primaryPostLocator(page, platform, postId) {
 }
 
 function platformName(platform) {
-  return platform === 'linkedin' ? 'LinkedIn' : 'X'
+  if (platform === 'linkedin') return 'LinkedIn'
+  if (platform === 'reddit') return 'Reddit'
+  return 'X'
 }
 
 function pageMatchesRequestedPost(url, platform, postId) {
   if (!url || !postId) return true
   if (platform === 'x') return url.includes(`/status/${postId}`)
+  if (platform === 'reddit') {
+    const redditId = parseRedditThingId(postId)
+    if (!redditId.raw) return true
+    const pathParts = urlPathParts(url)
+    if (redditId.kind === 't3') {
+      return pathParts.includes('comments') && pathParts.includes(redditId.raw)
+    }
+    if (redditId.kind === 't1') {
+      return pathParts.includes(redditId.raw) || String(url).includes(redditId.raw)
+    }
+    return pathParts.includes(redditId.raw) || String(url).includes(redditId.raw)
+  }
   if (url.includes(postId)) return true
   const match = String(postId).match(/(?:activity|share):(\d+)$/)
   return Boolean(match && url.includes(match[1]))
@@ -402,7 +544,7 @@ function pageMatchesRequestedPost(url, platform, postId) {
 
 async function restoreRequestedPost(page, job, warn) {
   try {
-    await page.goto(job.url, {
+    await page.goto(job.navigationUrl || job.url, {
       waitUntil: 'domcontentloaded',
       timeout: job.timeoutMs || 45000,
     })
@@ -423,6 +565,9 @@ function createCommentCapture(job) {
     max_comment_visits: job.maxCommentVisits ?? null,
     complete: true,
     stopped_reason: null,
+    expansion_rounds: 0,
+    expansion_clicks: 0,
+    reddit_morechildren_remaining: null,
     redirects_followed: [],
     visited_comment_urls: [],
     visited_comment_count: 0,
@@ -430,8 +575,19 @@ function createCommentCapture(job) {
 }
 
 function applyExpansionResult(commentCapture, result) {
-  if (!result || result.completed !== false) return
-  markCommentCaptureIncomplete(commentCapture, result.stopped_reason || 'expansion_incomplete')
+  if (!result) return
+  if (Number.isFinite(Number(result.rounds))) {
+    commentCapture.expansion_rounds = Number(result.rounds)
+  }
+  if (Number.isFinite(Number(result.clicks))) {
+    commentCapture.expansion_clicks = Number(result.clicks)
+  }
+  if (Number.isFinite(Number(result.reddit_morechildren_remaining))) {
+    commentCapture.reddit_morechildren_remaining = Number(result.reddit_morechildren_remaining)
+  }
+  if (result.completed === false) {
+    markCommentCaptureIncomplete(commentCapture, result.stopped_reason || 'expansion_incomplete')
+  }
 }
 
 function markCommentCaptureIncomplete(commentCapture, reason) {
@@ -487,11 +643,14 @@ async function expandCommentTree(page, rootPost, job, warn, commentCapture) {
     )
     if (!threadPost || !Array.isArray(threadPost.comments)) continue
 
-    const replies = limitComments(threadPost.comments, remaining)
+    const threadReplies = extractThreadReplies(threadPost.comments, item.comment, job.platform)
+    const replies = limitComments(threadReplies, remaining)
     setCommentDepths(replies, item.depth + 1)
     item.comment.replies = mergeCommentLists(item.comment.replies || [], replies)
     enqueueComments(queue, item.comment.replies, item.depth + 1)
   }
+
+  rootPost.comments = pruneAncestorDuplicateComments(rootPost.comments || [])
 }
 
 async function captureThreadReplies(
@@ -507,8 +666,8 @@ async function captureThreadReplies(
   const threadJob = {
     ...job,
     url: commentUrl,
-    postId: comment.id || statusIdFromUrl(commentUrl),
-    maxComments: remainingBudget,
+    postId: normalizeRedditThingId(comment.id) || postIdFromUrl(commentUrl, job.platform),
+    maxComments: threadMaxComments(job, remainingBudget),
   }
 
   try {
@@ -527,7 +686,8 @@ async function captureThreadReplies(
     applyExpansionResult(commentCapture, expansion)
 
     const currentUrl = page.url()
-    if (!pageMatchesRequestedPost(currentUrl, job.platform, threadJob.postId)) {
+    const stayedOnRequestedComment = canonicalUrl(currentUrl) === canonicalUrl(commentUrl)
+    if (!stayedOnRequestedComment && !pageMatchesRequestedPost(currentUrl, job.platform, threadJob.postId)) {
       if (!job.followCommentRedirects) {
         markCommentCaptureIncomplete(commentCapture, 'tree_redirect_not_followed')
         warn(
@@ -541,7 +701,7 @@ async function captureThreadReplies(
 
     return await extractPost(page, {
       ...threadJob,
-      postId: statusIdFromUrl(currentUrl) || threadJob.postId,
+      postId: postIdFromUrl(currentUrl, job.platform) || threadJob.postId,
     })
   } catch (err) {
     markCommentCaptureIncomplete(commentCapture, 'tree_capture_error')
@@ -567,6 +727,57 @@ function mergePostComments(basePost, extraPost) {
   return basePost
 }
 
+function extractThreadReplies(comments, parentComment, platform) {
+  if (platform !== 'reddit') return comments || []
+
+  const parent = findMatchingComment(comments || [], parentComment)
+  if (parent) return removeMatchingComments(parent.replies || [], parentComment)
+
+  return removeMatchingComments(comments || [], parentComment)
+}
+
+function findMatchingComment(comments, target) {
+  for (const comment of comments || []) {
+    if (commentsMatch(comment, target)) return comment
+    const nested = findMatchingComment(comment.replies || [], target)
+    if (nested) return nested
+  }
+  return null
+}
+
+function removeMatchingComments(comments, target) {
+  const output = []
+  for (const comment of comments || []) {
+    if (commentsMatch(comment, target)) continue
+    comment.replies = removeMatchingComments(comment.replies || [], target)
+    output.push(comment)
+  }
+  return output
+}
+
+function pruneAncestorDuplicateComments(comments, ancestors = []) {
+  const output = []
+  for (const comment of comments || []) {
+    if (ancestors.some((ancestor) => commentsMatch(comment, ancestor))) continue
+    comment.replies = pruneAncestorDuplicateComments(comment.replies || [], [...ancestors, comment])
+    output.push(comment)
+  }
+  return output
+}
+
+function commentsMatch(left, right) {
+  if (!left || !right) return false
+  const leftId = normalizedCommentId(left)
+  const rightId = normalizedCommentId(right)
+  if (leftId && rightId && leftId === rightId) return true
+
+  const leftUrl = canonicalUrl(left.url)
+  const rightUrl = canonicalUrl(right.url)
+  if (leftUrl && rightUrl && leftUrl === rightUrl) return true
+
+  return commentKey(left) === commentKey(right)
+}
+
 function mergeCommentLists(existing, incoming) {
   const existingByKey = new Map()
   for (const comment of existing || []) {
@@ -589,14 +800,21 @@ function mergeCommentLists(existing, incoming) {
 
 function commentKey(comment) {
   if (!comment) return ''
+  const id = normalizedCommentId(comment)
+  if (id) return `id:${id}`
+  const url = canonicalUrl(comment.url)
+  if (url) return `url:${url}`
   return [
-    comment.id || '',
-    comment.url || '',
     comment.author && comment.author.name ? comment.author.name : '',
     comment.author && comment.author.handle ? comment.author.handle : '',
     comment.posted_at || '',
     comment.text || '',
   ].join('|')
+}
+
+function normalizedCommentId(comment) {
+  if (!comment || !comment.id) return ''
+  return normalizeRedditThingId(comment.id) || String(comment.id)
 }
 
 function countCommentTree(comments) {
@@ -621,6 +839,11 @@ function hasReachedCommentBudget(rootPost, maxComments) {
 function hasReachedVisitBudget(commentCapture, maxVisits) {
   if (!maxVisits) return false
   return commentCapture.visited_comment_urls.length >= Number(maxVisits)
+}
+
+function threadMaxComments(job, remainingBudget) {
+  if (job.platform === 'reddit') return null
+  return remainingBudget
 }
 
 function limitComments(comments, budget) {
@@ -657,6 +880,37 @@ function canonicalUrl(url) {
   }
 }
 
+function normalizeRedditThingId(value) {
+  if (!value) return null
+  return String(value).replace(/^thing_/, '')
+}
+
+function parseRedditThingId(value) {
+  const normalized = normalizeRedditThingId(value)
+  if (!normalized) return { kind: null, raw: null }
+  const match = normalized.match(/^(t[13]_)?([A-Za-z0-9]+)/)
+  return {
+    kind: match && match[1] ? match[1].replace('_', '') : null,
+    raw: match ? match[2] : normalized,
+  }
+}
+
+function urlPathParts(url) {
+  try {
+    return new URL(url).pathname.split('/').filter(Boolean)
+  } catch {
+    return String(url || '').split(/[/?#]/).filter(Boolean)
+  }
+}
+
+function postIdFromUrl(url, platform) {
+  if (platform === 'reddit') {
+    const match = String(url || '').match(/\/comments\/[A-Za-z0-9_]+\/[^/]+\/([A-Za-z0-9_]+)/)
+    return match ? `t1_${match[1]}` : null
+  }
+  return statusIdFromUrl(url)
+}
+
 function statusIdFromUrl(url) {
   const match = String(url || '').match(/\/status(?:es)?\/(\d+)/)
   return match ? match[1] : null
@@ -665,13 +919,20 @@ function statusIdFromUrl(url) {
 async function runCapture() {
   try {
     const result = await main()
+    if (loadJob().resultPath) {
+      fs.writeFileSync(loadJob().resultPath, JSON.stringify(result), 'utf8')
+      return 'SOCIAL_READ_RESULT_FILE ' + loadJob().resultPath
+    }
     return 'SOCIAL_READ_RESULT ' + JSON.stringify(result)
   } catch (err) {
     let url = null
+    let resultPath = null
     try {
-      url = loadJob().url
+      const job = loadJob()
+      url = job.url
+      resultPath = job.resultPath || null
     } catch {}
-    return 'SOCIAL_READ_RESULT ' + JSON.stringify({
+    const result = {
       ok: false,
       url,
       final_url: null,
@@ -682,7 +943,12 @@ async function runCapture() {
       htmlFile: null,
       warnings: [],
       error: String(err && err.stack ? err.stack : err),
-    })
+    }
+    if (resultPath) {
+      fs.writeFileSync(resultPath, JSON.stringify(result), 'utf8')
+      return 'SOCIAL_READ_RESULT_FILE ' + resultPath
+    }
+    return 'SOCIAL_READ_RESULT ' + JSON.stringify(result)
   }
 }
 

@@ -10,12 +10,18 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from .extractors import LINKEDIN_EXTRACTION_SCRIPT, X_EXTRACTION_SCRIPT, post_from_raw
+from .extractors import (
+    LINKEDIN_EXTRACTION_SCRIPT,
+    REDDIT_EXTRACTION_SCRIPT,
+    X_EXTRACTION_SCRIPT,
+    post_from_raw,
+)
 from .markdown import render_markdown
 from .models import CaptureConfig, CapturePaths, SocialPost, to_plain
-from .urls import default_post_id, detect_platform
+from .urls import default_navigation_url, default_post_id, detect_platform
 
 RESULT_PREFIX = "SOCIAL_READ_RESULT "
+RESULT_FILE_PREFIX = "SOCIAL_READ_RESULT_FILE "
 
 
 class PlaywriterError(RuntimeError):
@@ -25,6 +31,7 @@ class PlaywriterError(RuntimeError):
 def capture(config: CaptureConfig) -> dict[str, Any]:
     platform = detect_platform(config.url)
     post_id = default_post_id(platform, config.url)
+    navigation_url = default_navigation_url(platform, config.url)
     paths = prepare_paths(config.output_dir)
     started_at = datetime.now(UTC).isoformat()
     driver = PlaywriterDriver(
@@ -38,13 +45,26 @@ def capture(config: CaptureConfig) -> dict[str, Any]:
     raw_result: dict[str, Any] | None = None
     cleanup_warning: str | None = None
     try:
-        raw_result = driver.capture(_build_job(config, platform=platform, post_id=post_id), paths)
+        raw_result = driver.capture(
+            _build_job(
+                config,
+                platform=platform,
+                post_id=post_id,
+                navigation_url=navigation_url,
+            ),
+            paths,
+        )
     finally:
         cleanup_warning = driver.close()
 
     raw_post = raw_result.get("post") if isinstance(raw_result.get("post"), dict) else {}
     post = post_from_raw(raw_post, platform=platform, requested_url=config.url, post_id=post_id)
     post.warnings.extend(str(item) for item in raw_result.get("warnings", []) if item)
+    if navigation_url != config.url:
+        post.warnings.append(
+            "Reddit capture used the old.reddit.com equivalent of the requested URL for public "
+            "page accessibility."
+        )
     _add_redirect_warning(post, platform=platform, requested_url=config.url, post_id=post_id)
     if cleanup_warning:
         post.warnings.append(cleanup_warning)
@@ -127,6 +147,7 @@ class PlaywriterDriver:
             "fullPageScreenshotPath": str(temp_dir / "full-page.png"),
             "postScreenshotPath": str(temp_dir / "post.png"),
             "htmlPath": str(temp_dir / "rendered.html"),
+            "resultPath": str(temp_dir / "result.json"),
         }
         temp_script.write_text(
             f"globalThis.SOCIAL_READ_JOB_OBJECT = {json.dumps(payload)};\n{base_script}",
@@ -183,6 +204,14 @@ class PlaywriterDriver:
 
     def _parse_result(self, stdout: str) -> dict[str, Any]:
         for line in reversed(stdout.splitlines()):
+            marker = line.find(RESULT_FILE_PREFIX)
+            if marker >= 0:
+                result_path = Path(line[marker + len(RESULT_FILE_PREFIX) :].strip())
+                data = json.loads(result_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise PlaywriterError("playwriter returned a non-object result")
+                return data
+
             marker = line.find(RESULT_PREFIX)
             if marker >= 0:
                 data = json.loads(line[marker + len(RESULT_PREFIX) :])
@@ -218,9 +247,16 @@ class PlaywriterDriver:
         result["screenshots"] = screenshots
 
 
-def _build_job(config: CaptureConfig, *, platform: str, post_id: str | None) -> dict[str, Any]:
+def _build_job(
+    config: CaptureConfig,
+    *,
+    platform: str,
+    post_id: str | None,
+    navigation_url: str | None = None,
+) -> dict[str, Any]:
     return {
         "url": config.url,
+        "navigationUrl": navigation_url or config.url,
         "platform": platform,
         "postId": post_id,
         "includeComments": config.include_comments,
@@ -235,6 +271,7 @@ def _build_job(config: CaptureConfig, *, platform: str, post_id: str | None) -> 
         "viewport": {"width": config.viewport_width, "height": config.viewport_height},
         "saveHtml": config.save_html,
         "xExtractionScript": X_EXTRACTION_SCRIPT,
+        "redditExtractionScript": REDDIT_EXTRACTION_SCRIPT,
         "linkedinExtractionScript": LINKEDIN_EXTRACTION_SCRIPT,
     }
 
@@ -283,6 +320,13 @@ def _add_redirect_warning(
             "LinkedIn redirected away from the requested post URL before extraction; "
             f"final URL was {post.final_url}."
         )
+    if platform == "reddit" and post_id and not _reddit_final_url_matches(
+        post.final_url, post_id
+    ):
+        post.warnings.append(
+            "Reddit redirected away from the requested post URL before extraction; "
+            f"final URL was {post.final_url}."
+        )
 
 
 def _linkedin_final_url_matches(final_url: str, post_id: str) -> bool:
@@ -290,6 +334,11 @@ def _linkedin_final_url_matches(final_url: str, post_id: str) -> bool:
         return True
     match = re.search(r"(?:activity|share):(\d+)$", post_id)
     return bool(match and match.group(1) in final_url)
+
+
+def _reddit_final_url_matches(final_url: str, post_id: str) -> bool:
+    raw_id = post_id.removeprefix("t3_")
+    return f"/comments/{raw_id}" in final_url or post_id in final_url
 
 
 def _build_manifest(
